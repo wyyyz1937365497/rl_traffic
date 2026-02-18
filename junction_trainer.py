@@ -100,9 +100,9 @@ class ExperienceBuffer:
 class MultiAgentPPOTrainer:
     """多智能体PPO训练器"""
     
-    def __init__(self, model: MultiJunctionModel, config: PPOConfig = None, 
+    def __init__(self, model: MultiJunctionModel, config: PPOConfig = None,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
-        self.model = model
+        self.model = model.to(device)
         self.config = config or PPOConfig()
         self.device = device
         

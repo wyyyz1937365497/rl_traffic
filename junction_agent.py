@@ -434,7 +434,7 @@ class JunctionAgent:
     
     def get_state_dim(self) -> int:
         """获取状态维度"""
-        return 16  # 基础14 + 类型B特有2
+        return 17  # 基础14 + 类型B特有2 + 时间1
     
     def get_action_dim(self) -> int:
         """获取动作维度"""

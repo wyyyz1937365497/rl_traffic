@@ -21,12 +21,12 @@ from junction_agent import JunctionType
 class NetworkConfig:
     """网络配置"""
     # 类型A网络配置（单纯匝道汇入）
-    type_a_state_dim: int = 16
+    type_a_state_dim: int = 17
     type_a_hidden_dims: List[int] = None
     type_a_action_dim: int = 3
-    
+
     # 类型B网络配置（匝道汇入+主路转出）
-    type_b_state_dim: int = 16
+    type_b_state_dim: int = 17
     type_b_hidden_dims: List[int] = None
     type_b_action_dim: int = 4
     
@@ -97,23 +97,26 @@ class SpatialAttention(nn.Module):
 
 class ConflictPredictor(nn.Module):
     """冲突预测模块 - 预测汇入冲突风险"""
-    
-    def __init__(self, feature_dim: int):
+
+    def __init__(self, feature_dim: int, other_dim: int = None):
         super().__init__()
-        
+
+        if other_dim is None:
+            other_dim = feature_dim
+
         self.predictor = nn.Sequential(
-            nn.Linear(feature_dim * 2, feature_dim),
+            nn.Linear(feature_dim + other_dim, feature_dim),
             nn.ReLU(),
             nn.Linear(feature_dim, 1),
             nn.Sigmoid()
         )
-    
+
     def forward(self, main_features: torch.Tensor, ramp_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
             main_features: [batch, feature_dim]
-            ramp_features: [batch, feature_dim]
-        
+            ramp_features: [batch, other_dim]
+
         Returns:
             conflict_prob: [batch, 1]
         """
@@ -123,22 +126,25 @@ class ConflictPredictor(nn.Module):
 
 class GapPredictor(nn.Module):
     """间隙预测模块 - 预测主路可接受间隙"""
-    
-    def __init__(self, feature_dim: int):
+
+    def __init__(self, input_dim: int, hidden_dim: int = None):
         super().__init__()
-        
+
+        if hidden_dim is None:
+            hidden_dim = max(input_dim // 2, 8)
+
         self.predictor = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim // 2),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(feature_dim // 2, 1),
+            nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
-    
+
     def forward(self, main_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            main_features: [batch, feature_dim]
-        
+            main_features: [batch, input_dim]
+
         Returns:
             gap_score: [batch, 1] 可接受间隙评分
         """
@@ -176,12 +182,12 @@ class TypeAPolicyNetwork(nn.Module):
         
         # 空间注意力
         self.spatial_attention = SpatialAttention(16, config.num_heads)
-        
-        # 冲突预测
-        self.conflict_predictor = ConflictPredictor(64)
-        
-        # 间隙预测
-        self.gap_predictor = GapPredictor(64)
+
+        # 冲突预测 (64维状态特征 + 16维注意力特征)
+        self.conflict_predictor = ConflictPredictor(64, 16)
+
+        # 间隙预测 (16维注意力特征)
+        self.gap_predictor = GapPredictor(16)
         
         # 主路控制头（控制主路CV车辆速度）
         self.main_control_head = nn.Sequential(
@@ -197,9 +203,9 @@ class TypeAPolicyNetwork(nn.Module):
             nn.Linear(32, 11)
         )
         
-        # 价值头
+        # 价值头 (state_features:64 + conflict_prob:1 + gap_score:1 = 66)
         self.value_head = nn.Sequential(
-            nn.Linear(64 + 32, 32),  # 状态特征 + 冲突/间隙特征
+            nn.Linear(66, 32),
             nn.ReLU(),
             nn.Linear(32, 1)
         )
@@ -297,12 +303,13 @@ class TypeBPolicyNetwork(nn.Module):
         })
         
         # 冲突预测（汇入冲突 + 转出冲突）
-        self.merge_conflict = ConflictPredictor(64)
-        self.diverge_conflict = ConflictPredictor(64)
-        
+        self.merge_conflict = ConflictPredictor(64, 16)
+        self.diverge_conflict = ConflictPredictor(64, 16)
+
         # 协调模块（汇入与转出的协调）
+        # 输入: state_features(64) + ramp_att(16) + diverge_att(16) = 96
         self.coordinator = nn.Sequential(
-            nn.Linear(64 * 3, 64),  # 主路 + 匝道 + 转出特征
+            nn.Linear(64 + 16 + 16, 64),  # 主路状态 + 匝道注意力 + 转出注意力
             nn.ReLU(),
             nn.Linear(64, 32)
         )
@@ -328,9 +335,9 @@ class TypeBPolicyNetwork(nn.Module):
             nn.Linear(32, 11)
         )
         
-        # 价值头
+        # 价值头 (state_features:64 + coord_features:32 + merge_conflict:1 + diverge_conflict:1 = 98)
         self.value_head = nn.Sequential(
-            nn.Linear(64 + 32 + 32, 32),  # 状态 + 协调 + 冲突特征
+            nn.Linear(98, 32),
             nn.ReLU(),
             nn.Linear(32, 1)
         )
@@ -638,13 +645,13 @@ class MultiJunctionModel(nn.Module):
         
         # 路口间协调
         coordinated_features = self.coordinator(junction_features)
-        
-        # 全局价值
-        if len(coordinated_features) > 0:
+
+        # 全局价值（只在所有路口都有输入时计算）
+        if len(coordinated_features) == len(self.junction_policies):
             global_feat = torch.cat(list(coordinated_features.values()), dim=-1)
             global_value = self.global_value(global_feat)
             all_info['global_value'] = global_value
-        
+
         return all_actions, all_values, all_info
 
 
