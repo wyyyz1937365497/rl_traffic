@@ -493,8 +493,8 @@ def train_model(config: Config = None, use_gui: bool = False):
     trainer = PPOTrainer(config)
     
     # 训练
-    save_dir = os.path.join('/home/z/my-project/rl_traffic', config.training.save_dir)
-    log_dir = os.path.join('/home/z/my-project/rl_traffic', config.training.log_dir)
+    save_dir = os.path.join(' sumo', config.training.save_dir)
+    log_dir = os.path.join(' sumo', config.training.log_dir)
     
     history = trainer.train(
         env,

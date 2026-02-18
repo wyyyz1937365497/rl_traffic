@@ -125,7 +125,7 @@ def run_training(args):
     trainer, history = train_model(config, use_gui=args.gui)
     
     # 保存训练历史
-    history_path = os.path.join('/home/z/my-project/rl_traffic', 'training_history.json')
+    history_path = os.path.join(' sumo', 'training_history.json')
     with open(history_path, 'w') as f:
         json.dump({k: [float(x) if isinstance(x, (np.floating, np.integer)) else x 
                        for x in v] for k, v in history.items()}, f, indent=2)
@@ -184,7 +184,7 @@ def run_evaluation(args):
     print(f"  最小OCR: {np.min(ocrs):.4f}")
     
     # 保存结果
-    results_path = os.path.join('/home/z/my-project/rl_traffic', 'evaluation_results.json')
+    results_path = os.path.join(' sumo', 'evaluation_results.json')
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     
@@ -249,7 +249,7 @@ def run_inference(args):
             print(f"  步数: {info['step']}, OCR: {info['ocr']:.4f}")
     
     # 保存结果
-    output_dir = '/home/z/my-project/competition_results'
+    output_dir = 'data_output/competition_results'
     os.makedirs(output_dir, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

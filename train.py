@@ -410,13 +410,13 @@ def main():
     trainer = AdvancedTrainer(config)
     
     # 训练
-    save_dir = os.path.join('/home/z/my-project/rl_traffic', args.save_dir)
-    log_dir = os.path.join('/home/z/my-project/rl_traffic', args.log_dir)
+    save_dir = os.path.join(' sumo', args.save_dir)
+    log_dir = os.path.join(' sumo', args.log_dir)
     
     history = trainer.train(env, eval_env, save_dir, log_dir)
     
     # 保存历史
-    history_path = os.path.join('/home/z/my-project/rl_traffic', 'training_history.json')
+    history_path = os.path.join(' sumo', 'training_history.json')
     with open(history_path, 'w') as f:
         json.dump({k: [float(x) if isinstance(x, (np.floating, np.integer)) else x 
                        for x in v] for k, v in history.items()}, f, indent=2)

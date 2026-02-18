@@ -84,8 +84,8 @@ def run_training(args):
     trainer = MultiAgentPPOTrainer(model, ppo_config)
     
     # 训练
-    save_dir = os.path.join('/home/z/my-project/rl_traffic', args.save_dir)
-    log_dir = os.path.join('/home/z/my-project/rl_traffic', args.log_dir)
+    save_dir = os.path.join(' sumo', args.save_dir)
+    log_dir = os.path.join(' sumo', args.log_dir)
     
     history = trainer.train(
         env, 
@@ -96,7 +96,7 @@ def run_training(args):
     )
     
     # 保存历史
-    history_path = os.path.join('/home/z/my-project/rl_traffic', 'junction_training_history.json')
+    history_path = os.path.join(' sumo', 'junction_training_history.json')
     with open(history_path, 'w') as f:
         json.dump(history, f, indent=2)
     
@@ -258,7 +258,7 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='多智能体路口交通控制')
     parser.add_argument('--sumo-cfg', type=str, 
-                       default='/home/z/my-project/upload/69761f47a243d0bfa932c23a_sumo.sumocfg',
+                       default='sumo/sumo.sumocfg',
                        help='SUMO配置文件路径')
     
     subparsers = parser.add_subparsers(dest='mode', help='运行模式')

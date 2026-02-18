@@ -143,13 +143,13 @@ class Config:
     def __post_init__(self):
         """初始化路径"""
         # 设置默认路径
-        base_path = "/home/z/my-project/upload"
+        base_path = "sumo"
         if not self.env.sumo_cfg:
-            self.env.sumo_cfg = os.path.join(base_path, "69761f47a243d0bfa932c23a_sumo.sumocfg")
+            self.env.sumo_cfg = os.path.join(base_path, "sumo.sumocfg")
         if not self.env.net_file:
-            self.env.net_file = os.path.join(base_path, "69761f47f065a3478a41386c_net.xml")
+            self.env.net_file = os.path.join(base_path, "net.xml")
         if not self.env.route_file:
-            self.env.route_file = os.path.join(base_path, "69761f47a243d0bfa932c23b_routes.xml")
+            self.env.route_file = os.path.join(base_path, "routes.xml")
 
 
 def get_default_config() -> Config:

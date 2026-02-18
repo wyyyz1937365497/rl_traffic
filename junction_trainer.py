@@ -608,13 +608,13 @@ def main():
     trainer = MultiAgentPPOTrainer(model)
     
     # 训练
-    save_dir = '/home/z/my-project/rl_traffic/checkpoints_junction'
-    log_dir = '/home/z/my-project/rl_traffic/logs_junction'
+    save_dir = ' sumo/checkpoints_junction'
+    log_dir = ' sumo/logs_junction'
     
     history = trainer.train(env, args.total_timesteps, eval_env, save_dir, log_dir)
     
     # 保存历史
-    history_path = '/home/z/my-project/rl_traffic/junction_training_history.json'
+    history_path = ' sumo/junction_training_history.json'
     with open(history_path, 'w') as f:
         json.dump(history, f, indent=2)
     
