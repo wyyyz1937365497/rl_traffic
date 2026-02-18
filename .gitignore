@@ -3,3 +3,7 @@
 *.pyc
 *.pkl
 *.zip
+sumo/logs_parallel/
+.claude/
+tmp/
+logs/

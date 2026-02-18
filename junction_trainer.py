@@ -218,11 +218,12 @@ class MultiAgentPPOTrainer:
         """获取车辆特征张量"""
         if not vehicle_ids:
             return None
-        
+
         features = []
         for veh_id in vehicle_ids[:10]:  # 最多10辆
             try:
-                import traci
+                # 使用全局traci（已经在junction_agent中导入为libsumo或traci）
+                from junction_agent import traci
                 feat = [
                     traci.vehicle.getSpeed(veh_id) / 20.0,
                     traci.vehicle.getLanePosition(veh_id) / 500.0,
@@ -236,10 +237,10 @@ class MultiAgentPPOTrainer:
                 features.append(feat)
             except:
                 continue
-        
+
         if not features:
             return None
-        
+
         return torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
     
     def _compute_log_prob(self, info: Dict, actions: Dict) -> float:
@@ -535,20 +536,45 @@ class MultiAgentPPOTrainer:
         return total_ocr / n_episodes
     
     def _compute_episode_ocr(self, env: MultiAgentEnvironment) -> float:
-        """计算回合OCR"""
+        """计算回合OCR（完整版）"""
         try:
-            import traci
-            arrived = 0
-            departed = 0
+            from junction_agent import traci
+
+            # 1. 获取到达车辆数
+            arrived = traci.simulation.getArrivedNumber()
+
+            # 2. 获取出发车辆数
+            departed = traci.simulation.getDepartedNumber()
+
+            # 3. 计算在途车辆的完成度
             inroute_completion = 0.0
-            
-            # 这里简化计算
-            for agent in env.agents.values():
-                if agent.current_state:
-                    arrived += len(agent.current_state.main_vehicles) + len(agent.current_state.ramp_vehicles)
-            
-            return arrived / max(1, departed + 1)
-        except:
+            total_vehicles = traci.vehicle.getCount()
+
+            for veh_id in traci.vehicle.getIDList():
+                try:
+                    # 获取路径进度
+                    route_idx = traci.vehicle.getRouteIndex(veh_id)
+                    route = traci.vehicle.getRoute(veh_id)
+                    route_len = len(route)
+
+                    if route_len > 0:
+                        # 完成度 = 当前路径索引 / 总路径长度
+                        completion = route_idx / route_len
+                        inroute_completion += completion
+                except:
+                    continue
+
+            # 4. 计算OCR
+            # OCR = (到达车辆数 + 在途车辆完成度之和) / 总出发车辆数
+            if total_vehicles == 0 and arrived == 0:
+                return 0.0
+
+            ocr = (arrived + inroute_completion) / max(departed, 1)
+
+            return min(ocr, 1.0)  # 限制在[0, 1]
+
+        except Exception as e:
+            print(f"OCR计算错误: {e}")
             return 0.0
     
     def save(self, path: str):

@@ -11,10 +11,15 @@ from enum import Enum
 import numpy as np
 
 try:
-    import traci
+    import libsumo as traci
+    USE_LIBSUMO = True
 except ImportError:
-    print("请安装traci: pip install traci")
-    sys.exit(1)
+    try:
+        import traci
+        USE_LIBSUMO = False
+    except ImportError:
+        print("请安装traci: pip install traci")
+        sys.exit(1)
 
 
 class JunctionType(Enum):
@@ -252,13 +257,26 @@ class JunctionAgent:
     def _observe_vehicles(self, edge_ids: List[str], traci_conn, incoming: bool = True) -> List[Dict]:
         """观察指定道路上的车辆"""
         vehicles = []
-        
+
         for edge_id in edge_ids:
             try:
                 veh_ids = traci_conn.edge.getLastStepVehicleIDs(edge_id)
-                
+
                 for veh_id in veh_ids:
                     try:
+                        # 获取车辆的OD信息
+                        try:
+                            route = traci_conn.vehicle.getRoute(veh_id)
+                            if route and len(route) > 0:
+                                origin = route[0]  # 起点
+                                destination = route[-1]  # 终点
+                            else:
+                                origin = edge_id
+                                destination = ''
+                        except:
+                            origin = edge_id
+                            destination = ''
+
                         veh_info = {
                             'id': veh_id,
                             'speed': traci_conn.vehicle.getSpeed(veh_id),
@@ -268,21 +286,23 @@ class JunctionAgent:
                             'waiting_time': traci_conn.vehicle.getWaitingTime(veh_id),
                             'accel': traci_conn.vehicle.getAcceleration(veh_id),
                             'is_cv': traci_conn.vehicle.getTypeID(veh_id) == 'CV',
-                            'route_index': traci_conn.vehicle.getRouteIndex(veh_id)
+                            'route_index': traci_conn.vehicle.getRouteIndex(veh_id),
+                            'origin': origin,      # 起点边
+                            'destination': destination  # 终点边
                         }
                         vehicles.append(veh_info)
                     except:
                         continue
-                        
+
             except:
                 continue
-        
+
         # 按位置排序（距离路口近的在前）
         if incoming:
             vehicles.sort(key=lambda v: -v['position'])  # 入边：位置大的在前
         else:
             vehicles.sort(key=lambda v: v['position'])   # 出边：位置小的在前
-        
+
         return vehicles
     
     def _compute_avg_speed(self, vehicles: List[Dict]) -> float:
@@ -605,36 +625,96 @@ class MultiAgentEnvironment:
                     continue
     
     def _compute_rewards(self) -> Dict[str, float]:
-        """计算每个智能体的奖励"""
+        """计算每个智能体的奖励（完整版）"""
         rewards = {}
-        
+
         for junc_id, agent in self.agents.items():
             state = agent.current_state
             if state is None:
                 rewards[junc_id] = 0.0
                 continue
-            
-            # 奖励组成
-            # 1. 通过量奖励
+
+            # 1. OCR奖励（核心指标）
+            ocr_reward = self._compute_ocr_reward(state)
+
+            # 2. 通过量奖励
             throughput_reward = -state.main_queue_length * 0.1 - state.ramp_queue_length * 0.2
-            
-            # 2. 等待时间惩罚
+
+            # 3. 等待时间惩罚
             waiting_penalty = -state.ramp_waiting_time * 0.05
-            
-            # 3. 冲突风险惩罚
+
+            # 4. 冲突风险惩罚
             conflict_penalty = -state.conflict_risk * 0.5
-            
-            # 4. 间隙利用奖励（匝道车辆能汇入）
+
+            # 5. 间隙利用奖励（匝道车辆能汇入）
             gap_reward = state.gap_acceptance * 0.2 if state.ramp_vehicles else 0
-            
-            # 5. 速度稳定性
+
+            # 6. 速度稳定性
             speed_stability = -abs(state.main_speed - state.ramp_speed) * 0.02
-            
-            total_reward = throughput_reward + waiting_penalty + conflict_penalty + gap_reward + speed_stability
-            
+
+            # 7. 信号灯协调奖励
+            signal_reward = self._compute_signal_reward(state)
+
+            # 8. 控制平滑性（避免频繁控制）
+            controlled = agent.get_controlled_vehicles()
+            num_controlled = len(controlled['main']) + len(controlled['ramp']) + len(controlled['diverge'])
+            control_smoothness = -num_controlled * 0.01
+
+            # 总奖励（加权组合）
+            total_reward = (
+                ocr_reward * 1.0 +           # OCR最重要
+                throughput_reward * 0.5 +
+                waiting_penalty * 0.3 +
+                conflict_penalty * 0.4 +
+                gap_reward * 0.2 +
+                speed_stability * 0.1 +
+                signal_reward * 0.3 +
+                control_smoothness * 0.1
+            )
+
             rewards[junc_id] = total_reward
-        
+
         return rewards
+
+    def _compute_ocr_reward(self, state: JunctionState) -> float:
+        """计算OCR奖励（局部）"""
+        try:
+            # 计算该路口的局部OCR
+            # 使用车辆完成度和通过量
+            total_vehicles = len(state.main_vehicles) + len(state.ramp_vehicles)
+
+            if total_vehicles == 0:
+                return 0.0
+
+            # 基于速度的完成度估计
+            main_completion = sum([v['speed'] / 20.0 for v in state.main_vehicles]) / max(len(state.main_vehicles), 1)
+            ramp_completion = sum([min(v['speed'] / 10.0, 1.0) for v in state.ramp_vehicles]) / max(len(state.ramp_vehicles), 1)
+
+            # 速度越快，完成度越高
+            local_ocr = (main_completion * len(state.main_vehicles) +
+                        ramp_completion * len(state.ramp_vehicles)) / max(total_vehicles, 1)
+
+            return local_ocr * 0.5  # 归一化并缩放
+        except:
+            return 0.0
+
+    def _compute_signal_reward(self, state: JunctionState) -> float:
+        """计算信号灯协调奖励"""
+        try:
+            # 检查匝道信号灯状态
+            if not state.ramp_vehicles:
+                return 0.0
+
+            # 如果有匝道车辆在等待
+            ramp_waiting = sum([1 for v in state.ramp_vehicles if v['speed'] < 1.0])
+
+            if ramp_waiting > 0:
+                # 有车辆等待，鼓励减少排队
+                return -ramp_waiting * 0.05
+
+            return 0.0
+        except:
+            return 0.0
     
     def _is_done(self) -> bool:
         """检查是否结束"""
