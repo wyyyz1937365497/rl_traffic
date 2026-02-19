@@ -17,7 +17,7 @@ import json
 # 添加父目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from sumo.main import SUMOCompetitionFramework
+from .sumo.main import SUMOCompetitionFramework
 
 
 def setup_evaluation_logger(eval_dir):

@@ -88,6 +88,11 @@ class ExperienceBuffer:
             self.dones.append(done)
         else:
             self.dones[-1] = done
+
+        # 调试：打印添加经验的信息
+        import logging
+        logger = logging.getLogger('buffer')
+        logger.debug(f"添加经验: junction_id={junction_id}, state_shape={state.shape}, reward={reward}")
     
     def clear(self):
         """清空缓冲区"""
@@ -100,9 +105,13 @@ class ExperienceBuffer:
         self.dones.clear()
     
     def __len__(self):
+        """返回缓冲区总大小（所有junction的经验总数）"""
         if not self.states:
             return 0
-        return len(next(iter(self.states.values())))
+
+        # 计算所有junction的经验总数
+        total = sum(len(states) for states in self.states.values())
+        return total
 
 
 class MultiAgentPPOTrainer:

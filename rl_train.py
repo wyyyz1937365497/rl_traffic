@@ -21,6 +21,7 @@ from multiprocessing import Process
 import multiprocessing
 import subprocess
 import threading
+import traceback as tb
 
 # ============== 订阅模式优化 ==============
 # 使用订阅模式提升数据收集速度 7-8x
@@ -155,16 +156,27 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 for agent in self.agents.values():
                     agent.state_history.clear()
 
+                # 1. 初始热身步进
                 for _ in range(10):
                     traci_wrapper.simulationStep()
                     self.current_step += 1
 
-                # 设置订阅（订阅模式优化）
+                # 2. 设置订阅（订阅模式优化）
                 self._setup_subscriptions()
 
-                # 应用CACC参数优化（与推理环境完全一致）
+                # 3. 应用CACC参数优化（与推理环境完全一致）
                 self._apply_cacc_parameters()
 
+                # ========== 关键修复：刷新订阅数据 ==========
+                # 订阅请求发出后，必须执行一次 simulationStep 才会有数据返回
+                traci_wrapper.simulationStep()
+                self.current_step += 1
+
+                # 然后必须调用 update_results 将数据从 traci 拉取到 SubscriptionManager 缓存中
+                self.sub_manager.update_results()
+                # ==========================================
+
+                # 4. 观察状态（此时 edge_results 已有数据）
                 observations = {junc_id: self.agents[junc_id].observe() for junc_id in self.agents.keys()}
                 self.logger.info(f"环境重置完成（订阅模式），current_step={self.current_step}")
                 return observations
@@ -195,6 +207,19 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 # 仿真一步
                 traci_wrapper.simulationStep()
                 self.current_step += 1
+
+                # ========== 关键修复：更新订阅结果 ==========
+                # 必须在 observe() 之前调用，否则订阅数据为空
+                self.sub_manager.update_results()
+
+                # 为新车辆设置订阅
+                current_vehicles = set(traci_wrapper.vehicle.getIDList())
+                new_vehicles = current_vehicles - self.sub_manager.subscribed_vehicles
+                if new_vehicles:
+                    self.sub_manager.setup_vehicle_subscription(list(new_vehicles))
+
+                # 清理已离开的车辆
+                self.sub_manager.cleanup_left_vehicles(current_vehicles)
 
                 # 观察新状态（订阅模式优化）
                 obs_start = time.time()
@@ -330,7 +355,12 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                     gap = state.gap_acceptance * 0.2 if state.ramp_vehicles else 0
                     speed_stability = -abs(state.main_speed - state.ramp_speed) * 0.02
 
-                    rewards[junc_id] = throughput + waiting + conflict + gap + speed_stability
+                    reward = throughput + waiting + conflict + gap + speed_stability
+                    rewards[junc_id] = reward
+
+                    # 调试：每1000步打印一次奖励详情
+                    if self.current_step % 1000 == 0 and self.current_step > 0:
+                        self.logger.info(f"路口 {junc_id} 奖励: {reward:.4f} (队列:{state.main_queue_length:.1f}/{state.ramp_queue_length:.1f}, 等待:{state.ramp_waiting_time:.1f})")
 
                 except Exception as e:
                     self.logger.warning(f"计算路口 {junc_id} 奖励失败: {e}")
@@ -450,9 +480,19 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
                 break
 
             # 存储经验（现在可以获取reward了）
+            # 调试：第一次step时打印rewards字典
+            if step_count == 0:
+                worker_logger.info(f"rewards字典键: {list(rewards.keys())}")
+                worker_logger.info(f"env.agents字典键: {list(env.agents.keys())}")
+
             for junc_id in env.agents.keys():
                 try:
                     reward = rewards.get(junc_id, 0.0)
+
+                    # 调试：第一次step时打印每个路口的奖励
+                    if step_count == 0:
+                        worker_logger.info(f"路口 {junc_id} 奖励: {reward:.6f}")
+
                     value = values.get(junc_id, torch.tensor(0.0))
                     log_prob = _compute_log_prob(info.get(junc_id, {}), actions.get(junc_id, {}))
 
@@ -682,21 +722,41 @@ def train(args):
                         with open(result_file, 'rb') as f:
                             result_data = pickle.load(f)
 
-                        for exp in result_data['experiences']:
-                            # 使用pin_memory加速CPU到GPU传输
-                            state_tensor = torch.from_numpy(exp['state']).float().pin_memory().to(device, non_blocking=True)
-                            vehicle_obs = {}
-                            for k, v in exp['vehicle_obs'].items():
-                                if isinstance(v, np.ndarray):
-                                    # 异步传输到GPU
-                                    vehicle_obs[k] = torch.from_numpy(v).float().pin_memory().to(device, non_blocking=True)
-                                else:
-                                    vehicle_obs[k] = v
+                        exp_count = len(result_data.get('experiences', []))
+                        tqdm.write(f"  📦 Worker {worker_id}: 读取 {exp_count} 条经验")
 
-                            buffer.add(
-                                exp['junction_id'], state_tensor, vehicle_obs,
-                                exp['action'], exp['reward'], exp['value'], exp['log_prob'], False
-                            )
+                        added_count = 0
+                        for exp in result_data['experiences']:
+                            try:
+                                # 使用pin_memory加速CPU到GPU传输
+                                state_tensor = torch.from_numpy(exp['state']).float().pin_memory().to(device, non_blocking=True)
+
+                                # 处理vehicle_obs - 确保所有值都是正确的类型
+                                vehicle_obs = {}
+                                for k, v in exp['vehicle_obs'].items():
+                                    if isinstance(v, np.ndarray):
+                                        # 异步传输到GPU
+                                        vehicle_obs[k] = torch.from_numpy(v).float().pin_memory().to(device, non_blocking=True)
+                                    elif v is None:
+                                        vehicle_obs[k] = None
+                                    else:
+                                        vehicle_obs[k] = v
+
+                                # 确保action也是正确的格式
+                                action = exp['action']
+                                if not isinstance(action, dict):
+                                    action = {}
+
+                                buffer.add(
+                                    exp['junction_id'], state_tensor, vehicle_obs,
+                                    action, exp['reward'], exp['value'], exp['log_prob'], False
+                                )
+                                added_count += 1
+                            except Exception as e:
+                                tqdm.write(f"  ⚠️  添加经验失败: {e}")
+                                continue
+
+                        tqdm.write(f"  ✅ 成功添加 {added_count}/{exp_count} 条经验到缓冲区")
 
                         # 收集统计
                         worker_reward = sum(result_data['total_rewards'].values())
@@ -714,11 +774,19 @@ def train(args):
 
                         total_steps += result_data['steps']
 
+                        # 打印缓冲区状态
+                        tqdm.write(f"  📊 当前缓冲区大小: {len(buffer)}")
+
                     except Exception as e:
-                        tqdm.write(f"  ⚠️  Worker {worker_id} 读取失败: {e}")
+                        tqdm.write(f"  ⚠️  Worker {worker_id} 读取失败: {e}\n{tb.format_exc()}")
 
             timesteps += total_steps
             collect_time = time.time() - start_time
+
+            # ========== 保存训练前统计 ==========
+            buffer_size_before = len(buffer)
+            total_rewards_sum = sum(total_rewards.values()) if total_rewards else 0.0
+            mean_reward_before = total_rewards_sum / len(total_rewards) if total_rewards else 0.0
 
             # 更新模型
             update_start = time.time()
@@ -748,13 +816,14 @@ def train(args):
             tqdm.write(f"📊 训练统计:")
             tqdm.write(f"  - 总步数: {timesteps:,} / {args.total_timesteps:,} ({timesteps/args.total_timesteps*100:.1f}%)")
             tqdm.write(f"  - 本次收集: {total_steps:,} 步")
-            tqdm.write(f"  - 缓冲区大小: {len(buffer):,} 样本")
+            tqdm.write(f"  - 训练前缓冲区: {buffer_size_before:,} 样本")  # 使用训练前的大小
+            tqdm.write(f"  - 训练后缓冲区: {len(buffer):,} 样本 (已清空)")
             tqdm.write(f"\n⏱️  时间统计:")
             tqdm.write(f"  - 数据收集: {collect_time:.1f}秒")
             tqdm.write(f"  - 模型更新: {update_time:.1f}秒")
             tqdm.write(f"  - 总耗时: {collect_time + update_time:.1f}秒")
             tqdm.write(f"\n🎯 性能指标:")
-            tqdm.write(f"  - 平均奖励: {mean_reward:.4f}")
+            tqdm.write(f"  - 平均奖励: {mean_reward_before:.4f}")  # 使用训练前计算的奖励
             tqdm.write(f"  - 损失: {update_result['loss']:.4f}")
             tqdm.write(f"  - 熵系数: {entropy_coef:.6f}")
             tqdm.write(f"\n🏢 路口奖励详情:")
