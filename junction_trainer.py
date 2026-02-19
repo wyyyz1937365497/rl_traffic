@@ -20,10 +20,8 @@ from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import GradScaler, autocast
 
-# ============== 订阅模式优化 ==============
 # 使用订阅模式提升数据收集速度 7-8x
-from junction_agent_subscription import JUNCTION_CONFIGS, JunctionAgent, MultiAgentEnvironment, SubscriptionManager
-# ==========================================
+from junction_agent import JUNCTION_CONFIGS, JunctionAgent, MultiAgentEnvironment, SubscriptionManager
 from junction_network import create_junction_model, NetworkConfig, MultiJunctionModel
 
 

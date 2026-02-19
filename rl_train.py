@@ -23,10 +23,7 @@ import subprocess
 import threading
 import traceback as tb
 
-# ============== 订阅模式优化 ==============
-# 使用订阅模式提升数据收集速度 7-8x
-from junction_agent_subscription import JUNCTION_CONFIGS
-# ==========================================
+from junction_agent import JUNCTION_CONFIGS
 
 from junction_network import create_junction_model, NetworkConfig
 from junction_trainer import PPOConfig, MultiAgentPPOTrainer
@@ -121,8 +118,8 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
         worker_logger.addHandler(handler)
         worker_logger.setLevel(logging.INFO)
 
-    import junction_agent_subscription  # 导入模块本身（用于设置traci连接）
-    from junction_agent_subscription import JunctionAgent, SubscriptionManager
+    import junction_agent  # 导入模块本身（用于设置traci连接）
+    from junction_agent import JunctionAgent, SubscriptionManager
 
     class Environment:
         def __init__(self, sumo_cfg: str, seed: int):
@@ -270,7 +267,7 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 # 1. 设置全局traci模块（sys.modules）
                 sys.modules['traci'] = traci_wrapper
                 # 2. 直接设置订阅模式模块的traci属性（因为模块级别引用已固定）
-                junction_agent_subscription.traci = traci_wrapper
+                junction_agent.traci = traci_wrapper
                 self.logger.debug("已设置traci连接（订阅模式兼容）")
 
             except Exception as e:
