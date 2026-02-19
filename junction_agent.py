@@ -303,7 +303,7 @@ class SubscriptionManager:
                     self.subscribed_vehicles.add(veh_id)
                 except Exception as e:
                     # libsumo可能会在车辆消失时抛出异常，忽略即可
-                    pass
+                    print(f"订阅车辆 {veh_id} 失败: {e}")
     
     def setup_edge_subscription(self, edge_ids: List[str],
                                 variables: List[int] = None):
@@ -322,9 +322,8 @@ class SubscriptionManager:
             try:
                 traci.edge.subscribe(edge_id, variables)
                 self.edge_subscriptions[edge_id] = variables
-            except:
-                print(f"无法订阅边 {edge_id}，可能已消失")
-                pass
+            except Exception as e:
+                print(f"订阅边 {edge_id} 失败: {e}")
     
     def setup_lane_subscription(self, lane_ids: List[str],
                                 variables: List[int] = None):
@@ -333,18 +332,18 @@ class SubscriptionManager:
         """
         if variables is None:
             variables = [
-                tc.LAST_STEP_VEHICLE_NUMBER,
-                tc.LAST_STEP_VEHICLE_ID_LIST,
-                tc.LAST_STEP_VEHICLE_NUMBER,
-                tc.LAST_STEP_MEAN_SPEED
+                0x10,  # LAST_STEP_VEHICLE_NUMBER (车辆总数)
+                0x13,  # LAST_STEP_VEHICLE_ID_LIST (车辆ID列表)
+                0x15,  # LAST_STEP_VEHICLE_HALTING_NUMBER (停止车辆数) - 关键修复
+                0x12   # LAST_STEP_MEAN_SPEED (平均速度)
             ]
 
         for lane_id in lane_ids:
             try:
                 traci.lane.subscribe(lane_id, variables)
                 self.lane_subscriptions[lane_id] = variables
-            except:
-                pass
+            except Exception as e:
+                print(f"订阅车道 {lane_id} 失败: {e}")
     
     def setup_traffic_light_subscription(self, tl_ids: List[str],
                                          variables: List[int] = None):
@@ -366,8 +365,8 @@ class SubscriptionManager:
             try:
                 traci.trafficlight.subscribe(tl_id, variables)
                 self.tl_subscriptions[tl_id] = variables
-            except:
-                pass
+            except Exception as e:
+                print(f"订阅信号灯 {tl_id} 失败: {e}")
     
     def update_results(self):
         """
@@ -380,40 +379,48 @@ class SubscriptionManager:
             self.vehicle_results = traci.vehicle.getAllSubscriptionResults()
             # 同步更新已订阅车辆集合（移除已消失的车辆）
             self.subscribed_vehicles = set(self.vehicle_results.keys())
-        except:
+        except Exception as e:
+            print(f"获取车辆订阅结果失败: {e}")
             self.vehicle_results = {}
-        
+
         # 2. 批量获取边订阅结果
         try:
             self.edge_results = traci.edge.getAllSubscriptionResults()
-        except:
+        except Exception as e:
+            print(f"获取边订阅结果失败: {e}")
             self.edge_results = {}
-        
+
         # 3. 批量获取车道订阅结果
         try:
             self.lane_results = traci.lane.getAllSubscriptionResults()
-        except:
+        except Exception as e:
+            print(f"获取车道订阅结果失败: {e}")
             self.lane_results = {}
-        
+
         # 4. 批量获取信号灯订阅结果
         try:
             self.tl_results = traci.trafficlight.getAllSubscriptionResults()
-        except:
+        except Exception as e:
+            print(f"获取信号灯订阅结果失败: {e}")
             self.tl_results = {}
     
     def get_vehicle_data(self, veh_id: str) -> Optional[Dict]:
         """获取单个车辆数据"""
         return self.vehicle_results.get(veh_id)
-    
+
     def get_edge_data(self, edge_id: str) -> Optional[Dict]:
         """获取单个边数据"""
         # print(self.edge_results)
         return self.edge_results.get(edge_id)
-    
+
+    def get_lane_data(self, lane_id: str) -> Optional[Dict]:
+        """获取单个车道数据"""
+        return self.lane_results.get(lane_id)
+
     def get_tl_data(self, tl_id: str) -> Optional[Dict]:
         """获取信号灯数据"""
         return self.tl_results.get(tl_id)
-    
+
     def cleanup_left_vehicles(self, current_vehicles: set):
         """清理已离开的车辆订阅 (已由 update_results 中的逻辑自动处理)"""
         pass
@@ -429,19 +436,18 @@ class JunctionAgent:
         self.config = config
         self.junction_id = config.junction_id
         self.junction_type = config.junction_type
-        
+
         # 订阅管理器
         self.sub_manager = subscription_manager or SubscriptionManager()
-        
+
         # 状态缓存
         self.current_state: Optional[JunctionState] = None
         self.state_history: List[JunctionState] = []
-        
+
         # 动作历史
         self.action_history: List[Dict] = []
-        
-        # 初始化信号灯相位信息
-        self._init_traffic_light_phases()
+
+        # 不在 __init__ 中初始化信号灯相位，等 SUMO 启动后在 setup_subscriptions 中初始化
     
     def _init_traffic_light_phases(self):
         """初始化信号灯相位信息"""
@@ -466,7 +472,8 @@ class JunctionAgent:
                     self.config.phases.append(tl_phase)
                 
                 self.config.num_phases = len(self.config.phases)
-        except:
+        except Exception as e:
+            print(f"获取信号灯 {self.config.tl_id} 相位信息失败，使用默认相位: {e}")
             # 如果无法获取，使用默认相位
             self.config.phases = [
                 TrafficLightPhase(0, "GGrrGG", 90, 0, 0),
@@ -475,6 +482,10 @@ class JunctionAgent:
     
     def setup_subscriptions(self):
         """设置该路口的所有订阅"""
+        # 初始化信号灯相位信息（此时 SUMO 已启动，只初始化一次）
+        if self.config.has_traffic_light and not self.config.phases:
+            self._init_traffic_light_phases()
+
         # 设置边订阅
         self.sub_manager.setup_edge_subscription(self.config.all_edges)
         
@@ -600,7 +611,8 @@ class JunctionAgent:
                 # 如果订阅数据中暂时没有，回退到即时查询（通常在第一步发生）
                 try:
                     veh_ids = traci.edge.getLastStepVehicleIDs(edge_id)
-                except:
+                except Exception as e:
+                    print(f"获取边 {edge_id} 车辆ID列表失败: {e}")
                     continue
 
             # 3. 获取车辆详细订阅数据
@@ -644,17 +656,25 @@ class JunctionAgent:
         """计算密度"""
         if not edge_ids:
             return 0.0
-        
+
         total_length = 0
         for edge_id in edge_ids:
             try:
-                total_length += traci.edge.getLength(edge_id)
-            except:
+                # 通过车道获取边长度（SUMO中边由车道组成）
+                lane_count = traci.edge.getLaneNumber(edge_id)
+                if lane_count > 0:
+                    # 获取第一条车道的长度作为边的长度
+                    first_lane_length = traci.lane.getLength(f"{edge_id}_0")
+                    total_length += first_lane_length
+                else:
+                    total_length += 100  # 默认值
+            except Exception as e:
+                print(f"获取边 {edge_id} 长度失败，使用默认值100: {e}")
                 total_length += 100
-        
+
         if total_length <= 0:
             return 0.0
-        
+
         return len(vehicles) / (total_length / 1000)
     
     def _get_queue_length(self, edge_ids: List[str]) -> int:
@@ -669,9 +689,11 @@ class JunctionAgent:
                     lane_data = self.sub_manager.get_lane_data(lane_id)
 
                     if lane_data:
-                        halting = self.sub_manager.get_subscription_value(lane_data, tc.LAST_STEP_VEHICLE_NUMBER, 0)
+                        # 使用 0x15 (LAST_STEP_VEHICLE_HALTING_NUMBER) 获取停止车辆数
+                        halting = self.sub_manager.get_subscription_value(lane_data, 0x15, 0)
                         queue_length += halting
-            except:
+            except Exception as e:
+                print(f"获取车道 {lane_id} 排队长度时出错: {e}")
                 pass
 
         return queue_length
@@ -906,8 +928,8 @@ class MultiAgentEnvironment:
         if self.is_running:
             try:
                 traci.close()
-            except:
-                pass
+            except Exception as e:
+                print(f"关闭已有TraCI连接失败: {e}")
         
         sumo_binary = "sumo-gui" if self.use_gui else "sumo"
         sumo_cmd = [
@@ -932,7 +954,8 @@ class MultiAgentEnvironment:
                     speed_limit = 13.89
                     target_speed = speed_limit * (0.3 + 0.9 * action)
                     traci.vehicle.setSpeed(veh_id, target_speed)
-                except:
+                except Exception as e:
+                    print(f"设置车辆 {veh_id} 速度失败: {e}")
                     continue
     
     def _compute_rewards(self) -> Dict[str, float]:
@@ -972,8 +995,8 @@ class MultiAgentEnvironment:
         try:
             if traci.simulation.getMinExpectedNumber() <= 0:
                 return True
-        except:
-            pass
+        except Exception as e:
+            print(f"检查仿真是否完成失败: {e}")
         
         return False
     
@@ -982,8 +1005,8 @@ class MultiAgentEnvironment:
         if self.is_running:
             try:
                 traci.close()
-            except:
-                pass
+            except Exception as e:
+                print(f"关闭TraCI连接失败: {e}")
             self.is_running = False
     
     def get_agent(self, junction_id: str) -> Optional[JunctionAgent]:

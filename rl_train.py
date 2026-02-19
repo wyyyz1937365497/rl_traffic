@@ -578,7 +578,8 @@ def _get_vehicle_features(vehicle_ids, device):
                 traci_wrapper.vehicle.getRouteIndex(veh_id) / 10.0,
                 0.0
             ])
-        except:
+        except Exception as e:
+            print(f"获取车辆 {veh_id} 特征失败: {e}")
             continue
 
     if not features:
@@ -675,8 +676,8 @@ def train(args):
             for f in os.listdir(temp_dir):
                 try:
                     os.remove(os.path.join(temp_dir, f))
-                except:
-                    pass
+                except Exception as e:
+                    print(f"删除临时文件 {f} 失败: {e}")
 
             # 启动工作进程（每个worker使用不同的种子）
             processes = []
@@ -869,8 +870,8 @@ def train(args):
         for f in os.listdir(temp_dir):
             try:
                 os.remove(os.path.join(temp_dir, f))
-            except:
-                pass
+            except Exception as e:
+                print(f"删除临时文件 {f} 失败: {e}")
         writer.close()
 
     # 保存模型

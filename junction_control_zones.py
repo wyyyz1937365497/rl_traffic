@@ -550,11 +550,12 @@ class MultiAgentEnvironmentWithZones:
                         'edge_length': edge_length,
                         'is_cv': traci.vehicle.getTypeID(veh_id) == 'CV'
                     }
-                except:
+                except Exception as e:
+                    print(f"获取车辆 {veh_id} 数据失败: {e}")
                     continue
-        except:
-            pass
-        
+        except Exception as e:
+            print(f"获取所有车辆数据失败: {e}")
+
         return all_vehicles
     
     def _compute_rewards(self) -> Dict[str, float]:
@@ -575,13 +576,13 @@ class MultiAgentEnvironmentWithZones:
         """检查是否结束"""
         if self.current_step >= 3600:
             return True
-        
+
         try:
             if traci.simulation.getMinExpectedNumber() <= 0:
                 return True
-        except:
-            pass
-        
+        except Exception as e:
+            print(f"检查仿真是否完成失败: {e}")
+
         return False
     
     def _start_sumo(self):
@@ -589,9 +590,9 @@ class MultiAgentEnvironmentWithZones:
         if self.is_running:
             try:
                 traci.close()
-            except:
-                pass
-        
+            except Exception as e:
+                print(f"关闭已有TraCI连接失败: {e}")
+
         sumo_binary = "sumo-gui" if self.use_gui else "sumo"
         sumo_cmd = [
             sumo_binary,
@@ -599,17 +600,17 @@ class MultiAgentEnvironmentWithZones:
             "--no-warnings", "true",
             "--seed", str(self.seed if self.seed else 42)
         ]
-        
+
         traci.start(sumo_cmd)
         self.is_running = True
-    
+
     def close(self):
         """关闭环境"""
         if self.is_running:
             try:
                 traci.close()
-            except:
-                pass
+            except Exception as e:
+                print(f"关闭TraCI连接失败: {e}")
             self.is_running = False
     
     def get_control_summary(self) -> Dict:

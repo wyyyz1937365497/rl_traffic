@@ -125,8 +125,8 @@ class InferenceAgent:
 
                     for veh_id in veh_ids:
                         main_speed += traci_conn.vehicle.getSpeed(veh_id)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"获取主路边 {edge_id} 状态失败: {e}")
 
             if main_vehicles:
                 main_speed /= len(main_vehicles)
@@ -149,8 +149,8 @@ class InferenceAgent:
                         ramp_speed += traci_conn.vehicle.getSpeed(veh_id)
                         waiting_time = traci_conn.vehicle.getWaitingTime(veh_id)
                         ramp_waiting_time = max(ramp_waiting_time, waiting_time)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"获取匝道边 {edge_id} 状态失败: {e}")
 
             if ramp_vehicles:
                 ramp_speed /= len(ramp_vehicles)
@@ -225,7 +225,8 @@ def get_vehicle_features(vehicle_ids, traci_conn, device):
                 0.0,  # route_index
                 0.0
             ])
-        except:
+        except Exception as e:
+            print(f"获取车辆 {veh_id} 特征失败: {e}")
             features.append([0.0] * 8)
 
     # 补齐到10个
@@ -321,8 +322,8 @@ def run_inference(args):
                     try:
                         traci.vehicle.setSpeed(veh_id, target_speed)
                         action_dict[junc_id][veh_id] = target_speed
-                    except:
-                        pass
+                    except Exception as e:
+                        print(f"设置主路车辆 {veh_id} 速度失败: {e}")
 
             if controlled['ramp'] and 'ramp' in action:
                 for veh_id in controlled['ramp'][:1]:
@@ -332,8 +333,8 @@ def run_inference(args):
                     try:
                         traci.vehicle.setSpeed(veh_id, target_speed)
                         action_dict[junc_id][veh_id] = target_speed
-                    except:
-                        pass
+                    except Exception as e:
+                        print(f"设置匝道车辆 {veh_id} 速度失败: {e}")
 
         # 仿真一步
         traci.simulationStep()

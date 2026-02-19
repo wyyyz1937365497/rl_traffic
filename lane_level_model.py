@@ -479,18 +479,18 @@ class LaneLevelEnvironment:
                 lane_count = traci.edge.getLaneNumber(edge)
                 for i in range(lane_count):
                     lanes.append(f"{edge}_{i}")
-            except:
-                pass
-        
+            except Exception as e:
+                print(f"获取主路边 {edge} 车道数失败: {e}")
+
         # 匝道车道
         for edge in config.get('ramp_incoming', []):
             try:
                 lane_count = traci.edge.getLaneNumber(edge)
                 for i in range(lane_count):
                     lanes.append(f"{edge}_{i}")
-            except:
-                pass
-        
+            except Exception as e:
+                print(f"获取匝道边 {edge} 车道数失败: {e}")
+
         return lanes
     
     def get_lane_features(self, junction_id: str) -> torch.Tensor:

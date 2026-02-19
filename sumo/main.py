@@ -143,8 +143,8 @@ class SUMOCompetitionFramework:
             try:
                 traci.trafficlight.getRedYellowGreenState(tl_id)
                 self.available_traffic_lights.append(tl_id)
-            except:
-                pass
+            except Exception as e:
+                print(f"检测信号灯 {tl_id} 失败: {e}")
 
         print(f"✓ 检测到 {len(self.available_traffic_lights)} 个可控制红绿灯")
 
@@ -229,8 +229,8 @@ class SUMOCompetitionFramework:
                             # 确保速度在合理范围内
                             target_speed = max(0.0, min(target_speed, speed_limit * 1.2))
                             traci.vehicle.setSpeed(veh_id, target_speed)
-                        except:
-                            pass
+                        except Exception as e:
+                            print(f"设置主路车辆 {veh_id} 速度失败: {e}")
 
                 # 控制匝道车辆
                 if controlled['ramp'] and 'ramp' in action:
@@ -243,8 +243,8 @@ class SUMOCompetitionFramework:
                             # 确保速度在合理范围内
                             target_speed = max(0.0, min(target_speed, speed_limit * 1.2))
                             traci.vehicle.setSpeed(veh_id, target_speed)
-                        except:
-                            pass
+                        except Exception as e:
+                            print(f"设置匝道车辆 {veh_id} 速度失败: {e}")
 
         except Exception as e:
             # 静默失败，不影响仿真
@@ -265,7 +265,8 @@ class SUMOCompetitionFramework:
                 tl_states[f'{tl_id}_state'] = state
                 tl_states[f'{tl_id}_phase'] = phase
                 tl_states[f'{tl_id}_remaining_time'] = remaining_time
-            except:
+            except Exception as e:
+                print(f"获取信号灯 {tl_id} 状态失败: {e}")
                 tl_states[f'{tl_id}_state'] = 'unknown'
                 tl_states[f'{tl_id}_phase'] = -1
                 tl_states[f'{tl_id}_remaining_time'] = -1
@@ -320,7 +321,8 @@ class SUMOCompetitionFramework:
             max_speed = traci.vehicletype.getMaxSpeed(vehicle_type)
             self.vehicle_type_maxspeed[vehicle_type] = max_speed
             return max_speed
-        except:
+        except Exception as e:
+            print(f"获取车辆类型 {vehicle_type} 最大速度失败: {e}")
             return 0.0
 
     def get_route_length(self, route_edges):
@@ -329,8 +331,8 @@ class SUMOCompetitionFramework:
         for edge_id in route_edges:
             try:
                 total_length += traci.lane.getLength(edge_id + "_0")
-            except:
-                pass
+            except Exception as e:
+                print(f"获取边 {edge_id} 长度失败: {e}")
         return total_length
 
     def calculate_traveled_distance(self, veh_id, route_info):
@@ -342,8 +344,8 @@ class SUMOCompetitionFramework:
             try:
                 edge_id = route_info['route_edges'][i]
                 traveled += traci.lane.getLength(edge_id + "_0")
-            except:
-                pass
+            except Exception as e:
+                print(f"计算车辆 {veh_id} 行驶距离失败: {e}")
 
         traveled += traci.vehicle.getLanePosition(veh_id)
         return traveled
@@ -362,8 +364,8 @@ class SUMOCompetitionFramework:
                         'max_speed': max_speed,
                         'violation': current_speed - max_speed
                     })
-            except:
-                pass
+            except Exception as e:
+                print(f"检查车辆 {veh_id} maxSpeed违规失败: {e}")
         return violations
 
     def collect_step_data(self, step):
@@ -645,8 +647,8 @@ class SUMOCompetitionFramework:
         """关闭仿真"""
         try:
             traci.close()
-        except:
-            pass
+        except Exception as e:
+            print(f"关闭TraCI连接失败: {e}")
 
 
 class RLAgent:
@@ -681,8 +683,8 @@ class RLAgent:
 
                     for veh_id in veh_ids:
                         main_speed += traci_conn.vehicle.getSpeed(veh_id)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"获取主路边 {edge_id} 状态失败: {e}")
 
             if main_vehicles:
                 main_speed /= len(main_vehicles)
@@ -705,8 +707,8 @@ class RLAgent:
                         ramp_speed += traci_conn.vehicle.getSpeed(veh_id)
                         waiting_time = traci_conn.vehicle.getWaitingTime(veh_id)
                         ramp_waiting_time = max(ramp_waiting_time, waiting_time)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"获取匝道边 {edge_id} 状态失败: {e}")
 
             if ramp_vehicles:
                 ramp_speed /= len(ramp_vehicles)
@@ -725,8 +727,8 @@ class RLAgent:
                     if traci_conn.vehicle.getTypeID(veh_id) == 'CV':
                         has_cv = True
                         break
-                except:
-                    pass
+                except Exception as e:
+                    print(f"检测车辆 {veh_id} 类型失败: {e}")
 
             self.current_state = {
                 'main_queue_length': main_queue_length,
@@ -782,15 +784,15 @@ class RLAgent:
             for edge_id in main_edges:
                 try:
                     main_vehicles.extend(traci.edge.getLastStepVehicleIDs(edge_id))
-                except:
-                    pass
+                except Exception as e:
+                    print(f"获取主路边 {edge_id} 受控车辆失败: {e}")
 
             ramp_vehicles = []
             for edge_id in ramp_edges:
                 try:
                     ramp_vehicles.extend(traci.edge.getLastStepVehicleIDs(edge_id))
-                except:
-                    pass
+                except Exception as e:
+                    print(f"获取匝道边 {edge_id} 受控车辆失败: {e}")
 
             return {
                 'main': main_vehicles[:1] if main_vehicles else [],
@@ -798,7 +800,8 @@ class RLAgent:
                 'diverge': []
             }
 
-        except:
+        except Exception as e:
+            print(f"获取受控车辆失败: {e}")
             return {'main': [], 'ramp': [], 'diverge': []}
 
     def get_vehicle_features(self, vehicle_ids, traci_conn, device):
@@ -819,7 +822,8 @@ class RLAgent:
                     0.0,
                     0.0
                 ])
-            except:
+            except Exception as e:
+                print(f"获取车辆 {veh_id} 特征失败: {e}")
                 features.append([0.0] * 8)
 
         while len(features) < 10:

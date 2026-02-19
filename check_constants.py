@@ -4,8 +4,8 @@ import sys
 try:
     import traci
     print("Using traci")
-except:
-    print("traci not available")
+except ImportError as e:
+    print(f"traci not available: {e}")
     sys.exit(1)
 
 # Find LAST_STEP constants

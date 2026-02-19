@@ -166,8 +166,8 @@ class TrafficEnvironment:
         if self.is_running:
             try:
                 traci.close()
-            except:
-                pass
+            except Exception as e:
+                print(f"关闭TraCI连接失败: {e}")
             self.is_running = False
     
     def reset(self) -> Dict[str, np.ndarray]:
@@ -428,8 +428,8 @@ class TrafficEnvironment:
                     lane_id = f"{edge_id}_{lane_idx}"
                     try:
                         queue_length += traci.lane.getWaitingTime(lane_id) > 0
-                    except:
-                        pass
+                    except Exception as e:
+                        print(f"获取车道 {lane_id} 等待时间失败: {e}")
                 
                 self.edge_states[edge_id] = EdgeState(
                     edge_id=edge_id,
@@ -459,8 +459,8 @@ class TrafficEnvironment:
                 for lane_id in controlled_lanes:
                     try:
                         waiting_vehicles += traci.lane.getLastStepHaltingNumber(lane_id)
-                    except:
-                        pass
+                    except Exception as e:
+                        print(f"获取车道 {lane_id} 等待车辆数失败: {e}")
                 
                 self.junction_states[junction_id] = JunctionState(
                     junction_id=junction_id,

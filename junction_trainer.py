@@ -18,7 +18,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 # 使用订阅模式提升数据收集速度 7-8x
 from junction_agent import JUNCTION_CONFIGS, JunctionAgent, MultiAgentEnvironment, SubscriptionManager
@@ -40,9 +40,9 @@ class PPOConfig:
     max_grad_norm: float = 0.5
     
     # 训练参数
-    batch_size: int = 512  # 增大到512以充分利用GPU
-    n_epochs: int = 10
-    update_frequency: int = 2048  # 增大更新频率
+    batch_size: int = 2048  # 增大到2048以充分利用GPU并行能力
+    n_epochs: int = 5  # 减少epoch次数，5次通常足够
+    update_frequency: int = 4096  # 增大更新频率，收集更多数据再更新
     
     # 探索
     entropy_decay: float = 0.999
@@ -253,7 +253,8 @@ class MultiAgentPPOTrainer:
                     0.0  # 预留
                 ]
                 features.append(feat)
-            except:
+            except Exception as e:
+                print(f"获取车辆 {veh_id} 特征失败: {e}")
                 continue
 
         if not features:
@@ -289,6 +290,7 @@ class MultiAgentPPOTrainer:
         all_states_list = []
         all_log_probs_list = []
         junction_indices_list = []
+        all_vehicle_obs_list = []  # 新增：预加载vehicle observations
         total_samples = 0
 
         for junc_idx, junc_id in enumerate(junction_ids):
@@ -331,6 +333,17 @@ class MultiAgentPPOTrainer:
             all_log_probs_list.extend(self.buffer.log_probs[junc_id])
             junction_indices_list.extend([junc_idx] * n_samples)
 
+            # 预加载vehicle observations到GPU
+            junc_vehicle_obs = []
+            for vehicle_obs_dict in self.buffer.vehicle_states[junc_id]:
+                # 将每个vehicle_obs_dict转为GPU tensor
+                gpu_dict = {}
+                for key, value in vehicle_obs_dict.items():
+                    if value is not None and torch.is_tensor(value):
+                        gpu_dict[key] = value.to(self.device)
+                junc_vehicle_obs.append(gpu_dict)
+            all_vehicle_obs_list.append(junc_vehicle_obs)
+
         # 第二步：合并所有junction的数据（一次性的cat操作）
         all_returns = torch.cat(all_returns_list, dim=0)
         all_advantages = torch.cat(all_advantages_list, dim=0)
@@ -349,15 +362,8 @@ class MultiAgentPPOTrainer:
         # 创建junction索引tensor
         junction_indices = torch.tensor(junction_indices_list, dtype=torch.long, device=self.device)
 
-        return (
-            all_states,  # [total_samples, state_dim]
-            all_returns,  # [total_samples]
-            all_advantages,  # [total_samples]
-            all_log_probs,  # [total_samples]
-            junction_indices,  # [total_samples]
-            junction_ids  # List[str]
-        )
-    
+        return all_states, all_returns, all_advantages, all_log_probs, junction_indices, junction_ids, all_vehicle_obs_list
+
     def update(self) -> Dict[str, float]:
         """更新模型 - 优化版本，使用统一批次避免嵌套循环"""
         self.model.train()
@@ -366,8 +372,8 @@ class MultiAgentPPOTrainer:
         if total_samples < self.config.batch_size:
             return {'loss': 0.0}
 
-        # 计算GAE（完全在GPU上）
-        all_states, all_returns, all_advantages, all_log_probs, junction_indices, junction_ids = self.compute_gae()
+        # 计算GAE（完全在GPU上，包括预加载vehicle observations）
+        all_states, all_returns, all_advantages, all_log_probs, junction_indices, junction_ids, all_vehicle_obs = self.compute_gae()
 
         total_loss = 0.0
         n_batches = 0
@@ -404,30 +410,31 @@ class MultiAgentPPOTrainer:
                     junc_advantages = batch_advantages[mask]
                     junc_old_log_probs = batch_old_log_probs[mask]
 
-                    # 准备vehicle observations（从buffer中获取）
-                    vehicle_obs_list = []
-                    for idx in batch_indices[mask].cpu().numpy():
-                        # 计算原始buffer中的位置
-                        orig_junc_idx = junction_indices[idx].item()
-                        start_pos = 0
-                        for ji in range(orig_junc_idx):
-                            start_pos += len(self.buffer.states[junction_ids[ji]])
-                        local_idx = (idx - start_pos).item()
-                        vehicle_obs_list.append(self.buffer.vehicle_states[junction_ids[orig_junc_idx]][local_idx])
+                    # 准备vehicle observations（从预加载的GPU数据中获取）
+                    # 首先获取该batch中属于当前junction的样本索引
+                    selected_indices = batch_indices[mask]
 
-                    # 构造vehicle_obs字典
+                    # 计算该junction在总样本中的起始位置
+                    start_pos = 0
+                    for ji in range(junc_idx):
+                        start_pos += len(self.buffer.states[junction_ids[ji]])
+
+                    # 从预加载的vehicle_obs中提取对应的样本（直接在GPU上操作）
                     junc_vehicle_obs = {junc_id: {}}
-                    for vo in vehicle_obs_list:
-                        for key, value in vo.items():
-                            if value is not None:
-                                if key not in junc_vehicle_obs[junc_id]:
-                                    junc_vehicle_obs[junc_id][key] = []
-                                junc_vehicle_obs[junc_id][key].append(value)
+                    for local_idx, global_idx in enumerate(selected_indices):
+                        orig_idx = (global_idx - start_pos).item()
+                        if orig_idx >= 0 and orig_idx < len(all_vehicle_obs[junc_idx]):
+                            vo_dict = all_vehicle_obs[junc_idx][orig_idx]
+                            for key, value in vo_dict.items():
+                                if value is not None:
+                                    if key not in junc_vehicle_obs[junc_id]:
+                                        junc_vehicle_obs[junc_id][key] = []
+                                    junc_vehicle_obs[junc_id][key].append(value)
 
-                    # 转换为tensor（一次性）
+                    # Stack为tensor（一次性，在GPU上）
                     for key in junc_vehicle_obs[junc_id]:
                         if junc_vehicle_obs[junc_id][key]:
-                            junc_vehicle_obs[junc_id][key] = torch.stack(junc_vehicle_obs[junc_id][key]).to(self.device)
+                            junc_vehicle_obs[junc_id][key] = torch.stack(junc_vehicle_obs[junc_id][key])
 
                     # 前向传播
                     obs_dict = {junc_id: junc_states}
@@ -451,8 +458,18 @@ class MultiAgentPPOTrainer:
                         policy_loss = -torch.min(surr1, surr2).mean()
 
                         # 价值损失
-                        value_pred = new_values.get(junc_id, torch.zeros_like(junc_returns))
-                        value_loss = F.mse_loss(value_pred.squeeze()[:min_size], junc_returns)
+                        value_pred = new_values.get(junc_id)
+                        if value_pred is None:
+                            # 如果模型没有返回该路口的价值预测，使用零值
+                            value_pred = torch.zeros(junc_returns.size(0), 1, device=self.device)
+
+                        # 确保 value_pred 的形状正确，并匹配 min_size
+                        if value_pred.dim() > 1:
+                            value_pred = value_pred.squeeze(-1)
+                        if value_pred.size(0) != min_size:
+                            value_pred = value_pred[:min_size]
+
+                        value_loss = F.mse_loss(value_pred, junc_returns)
 
                         # 熵损失
                         entropy = self._compute_entropy(new_info.get(junc_id, {}))
@@ -683,7 +700,8 @@ class MultiAgentPPOTrainer:
                         # 完成度 = 当前路径索引 / 总路径长度
                         completion = route_idx / route_len
                         inroute_completion += completion
-                except:
+                except Exception as e:
+                    print(f"获取车辆 {veh_id} 路径完成度失败: {e}")
                     continue
 
             # 4. 计算OCR
