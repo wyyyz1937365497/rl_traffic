@@ -213,30 +213,31 @@ class SubscriptionManager:
         # 订阅上下文
         self.subscription_context = {}
     
-    def setup_vehicle_subscription(self, veh_ids: List[str], 
-                                   variables: List[str] = None):
+    def setup_vehicle_subscription(self, veh_ids: List[str],
+                                   variables: List[int] = None):
         """
         设置车辆订阅
-        
+
         Args:
             veh_ids: 车辆ID列表
-            variables: 要订阅的变量列表
+            variables: 要订阅的变量列表（使用常量值）
         """
         if variables is None:
+            # 使用常量值（兼容所有SUMO版本）
             variables = [
-                traci.constants.VAR_SPEED,
-                traci.constants.VAR_POSITION,
-                traci.constants.VAR_ANGLE,
-                traci.constants.VAR_LANE_INDEX,
-                traci.constants.VAR_LANE_POSITION,
-                traci.constants.VAR_ROAD_ID,
-                traci.constants.VAR_ROUTE_INDEX,
-                traci.constants.VAR_WAITING_TIME,
-                traci.constants.VAR_ACCELERATION,
-                traci.constants.VAR_VEHICLECLASS,
-                traci.constants.VAR_TYPE
+                0x40,  # VAR_SPEED
+                0x42,  # VAR_POSITION
+                0x41,  # VAR_ANGLE
+                0x53,  # VAR_LANE_INDEX
+                0x43,  # VAR_LANE_POSITION
+                0x49,  # VAR_ROAD_ID
+                0x56,  # VAR_ROUTE_INDEX
+                0x4B,  # VAR_WAITING_TIME
+                0x4A,  # VAR_ACCELERATION
+                0x4D,  # VAR_VEHICLECLASS
+                0x4E   # VAR_TYPE
             ]
-        
+
         for veh_id in veh_ids:
             if veh_id not in self.subscribed_vehicles:
                 try:
@@ -246,22 +247,23 @@ class SubscriptionManager:
                     pass
     
     def setup_edge_subscription(self, edge_ids: List[str],
-                                variables: List[str] = None):
+                                variables: List[int] = None):
         """
         设置道路边订阅
-        
+
         Args:
             edge_ids: 边ID列表
-            variables: 要订阅的变量列表
+            variables: 要订阅的变量列表（使用常量值而不是名称）
         """
         if variables is None:
+            # 使用常量值（兼容所有SUMO版本）
             variables = [
-                traci.constants.LAST_STEP_VEHICLE_NUMBER,
-                traci.constants.LAST_STEP_MEAN_SPEED,
-                traci.constants.LAST_STEP_VEHICLE_IDS,
-                traci.constants.LAST_STEP_OCCUPANCY
+                0x11,  # VAR_LAST_STEP_VEHICLE_NUMBER
+                0x12,  # VAR_LAST_STEP_MEAN_SPEED
+                0x13,  # VAR_LAST_STEP_VEHICLE_DATA (替代LAST_STEP_VEHICLE_IDS)
+                0x14   # VAR_LAST_STEP_OCCUPANCY
             ]
-        
+
         for edge_id in edge_ids:
             try:
                 traci.edge.subscribe(edge_id, variables)
@@ -270,22 +272,23 @@ class SubscriptionManager:
                 pass
     
     def setup_lane_subscription(self, lane_ids: List[str],
-                                variables: List[str] = None):
+                                variables: List[int] = None):
         """
         设置车道订阅
-        
+
         Args:
             lane_ids: 车道ID列表
-            variables: 要订阅的变量列表
+            variables: 要订阅的变量列表（使用常量值）
         """
         if variables is None:
+            # 使用常量值（兼容所有SUMO版本）
             variables = [
-                traci.constants.LAST_STEP_VEHICLE_NUMBER,
-                traci.constants.LAST_STEP_VEHICLE_IDS,
-                traci.constants.LAST_STEP_HALTING_NUMBER,
-                traci.constants.LAST_STEP_MEAN_SPEED
+                0x11,  # VAR_LAST_STEP_VEHICLE_NUMBER
+                0x13,  # VAR_LAST_STEP_VEHICLE_DATA
+                0x10,  # VAR_LAST_STEP_HALTING_NUMBER
+                0x12   # VAR_LAST_STEP_MEAN_SPEED
             ]
-        
+
         for lane_id in lane_ids:
             try:
                 traci.lane.subscribe(lane_id, variables)
@@ -294,25 +297,26 @@ class SubscriptionManager:
                 pass
     
     def setup_traffic_light_subscription(self, tl_ids: List[str],
-                                         variables: List[str] = None):
+                                         variables: List[int] = None):
         """
         设置信号灯订阅
-        
+
         Args:
             tl_ids: 信号灯ID列表
-            variables: 要订阅的变量列表
+            variables: 要订阅的变量列表（使用常量值）
         """
         if variables is None:
+            # 使用常量值（兼容所有SUMO版本）
             variables = [
-                traci.constants.TL_CURRENT_PHASE,
-                traci.constants.TL_CURRENT_PROGRAM,
-                traci.constants.TL_PHASE_DURATION,
-                traci.constants.TL_NEXT_SWITCH,
-                traci.constants.TL_RED_YELLOW_GREEN_STATE,
-                traci.constants.TL_CONTROLLED_LANES,
-                traci.constants.TL_CONTROLLED_LINKS
+                0x50,  # VAR_TL_CURRENT_PHASE
+                0x51,  # VAR_TL_CURRENT_PROGRAM
+                0x54,  # VAR_TL_PHASE_DURATION
+                0x5A,  # VAR_TL_NEXT_SWITCH
+                0x59,  # VAR_TL_RED_YELLOW_GREEN_STATE
+                0x5B,  # VAR_TL_CONTROLLED_LANES
+                0x5C   # VAR_TL_CONTROLLED_LINKS
             ]
-        
+
         for tl_id in tl_ids:
             try:
                 traci.trafficlight.subscribe(tl_id, variables)
@@ -320,28 +324,28 @@ class SubscriptionManager:
             except:
                 pass
     
-    def setup_context_subscription(self, edge_ids: List[str], 
+    def setup_context_subscription(self, edge_ids: List[str],
                                    radius: float = 200.0):
         """
         设置上下文订阅（检测范围内的车辆）
-        
+
         Args:
             edge_ids: 边ID列表
             radius: 检测半径
         """
         vehicle_vars = [
-            traci.constants.VAR_SPEED,
-            traci.constants.VAR_POSITION,
-            traci.constants.VAR_LANE_POSITION,
-            traci.constants.VAR_ROAD_ID,
-            traci.constants.VAR_WAITING_TIME,
-            traci.constants.VAR_VEHICLECLASS
+            0x40,  # VAR_SPEED
+            0x42,  # VAR_POSITION
+            0x43,  # VAR_LANE_POSITION
+            0x49,  # VAR_ROAD_ID
+            0x4B,  # VAR_WAITING_TIME
+            0x4D   # VAR_VEHICLECLASS
         ]
-        
+
         for edge_id in edge_ids:
             try:
                 # 使用边订阅获取车辆ID
-                traci.edge.subscribe(edge_id, [traci.constants.LAST_STEP_VEHICLE_IDS])
+                traci.edge.subscribe(edge_id, [0x13])  # VAR_LAST_STEP_VEHICLE_DATA
             except:
                 pass
     
@@ -786,7 +790,7 @@ class JunctionAgent:
     
     def get_state_dim(self) -> int:
         """获取状态维度"""
-        return 22  # 基础19 + 类型B特有3
+        return 23  # 基础19 + 类型B特有3 + 时间1 = 23
     
     def get_action_dim(self) -> int:
         """获取动作维度"""

@@ -1,5 +1,4 @@
 import os
-from vehicle_type_config import normalize_speed, get_vehicle_max_speed
 import sys
 import traci
 import pandas as pd
@@ -9,15 +8,6 @@ import json
 import pickle
 import torch
 import numpy as np
-import logging
-import traceback as tb
-
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(levelname)s] %(message)s'
-)
-logger = logging.getLogger('sumo_main')
 
 # 添加父目录到路径以导入模型
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -449,75 +439,6 @@ class SUMOCompetitionFramework:
                   f"累计出发: {self.cumulative_departed}, "
                   f"累计到达: {self.cumulative_arrived}")
 
-    def calculate_ocr_metrics(self):
-        """
-        计算OCR（Overall Completion Rate）指标
-
-        Returns:
-            dict: 包含各种OCR指标的字典
-        """
-        # 全局OCR
-        global_ocr = self.cumulative_arrived / max(self.cumulative_departed, 1)
-
-        # 根据OD信息计算分类OCR
-        main_departed = 0
-        main_arrived = 0
-        ramp_departed = 0
-        ramp_arrived = 0
-        diverge_departed = 0
-        diverge_arrived = 0
-
-        for veh_id, od_info in self.vehicle_od_data.items():
-            # 获取车辆出发边缘
-            depart_edge = od_info.get('depart_edge', '')
-
-            # 获取车辆到达边缘
-            arrive_edge = od_info.get('arrive_edge', '')
-            did_arrive = arrive_edge != ''
-
-            # 判断车辆类型（基于出发边缘）
-            if 'main' in depart_edge.lower() or depart_edge.startswith('-'):
-                # 主路车辆
-                main_departed += 1
-                if did_arrive:
-                    main_arrived += 1
-            elif 'ramp' in depart_edge.lower():
-                # 匝道车辆
-                ramp_departed += 1
-                if did_arrive:
-                    ramp_arrived += 1
-
-            # 判断转出车辆（基于到达边缘）
-            if did_arrive and 'diverge' in arrive_edge.lower():
-                diverge_arrived += 1
-                # 如果出发是主路或匝道，也算作转出出发
-                if 'main' in depart_edge.lower() or depart_edge.startswith('-'):
-                    diverge_departed += 1
-                elif 'ramp' in depart_edge.lower():
-                    diverge_departed += 1
-
-        # 计算各类OCR
-        main_ocr = main_arrived / max(main_departed, 1)
-        ramp_ocr = ramp_arrived / max(ramp_departed, 1)
-        diverge_ocr = diverge_arrived / max(diverge_departed, 1)
-
-        return {
-            'global_ocr': global_ocr,
-            'main_road_ocr': main_ocr,
-            'ramp_road_ocr': ramp_ocr,
-            'diverge_road_ocr': diverge_ocr,
-            'statistics': {
-                'total_departed': self.cumulative_departed,
-                'total_arrived': self.cumulative_arrived,
-                'main_departed': main_departed,
-                'main_arrived': main_arrived,
-                'ramp_departed': ramp_departed,
-                'ramp_arrived': ramp_arrived,
-                'diverge_departed': diverge_departed,
-                'diverge_arrived': diverge_arrived
-            }
-        }
-
     def save_to_pickle(self, output_dir="competition_results"):
         """保存数据到pickle文件"""
         print(f"\n[第三部分] 正在保存仿真数据到Pickle格式...")
@@ -577,9 +498,6 @@ class SUMOCompetitionFramework:
         print(f"设备: {self.device}")
         print(f"模型状态: {'已加载' if self.model_loaded else '未加载'}")
 
-        # 应用CACC参数优化（与训练环境完全一致）
-        self._apply_cacc_parameters()
-
         step = 0
         while step < 3600:  # 默认3600步
             # 应用控制算法
@@ -594,52 +512,6 @@ class SUMOCompetitionFramework:
             step += 1
 
         print(f"\n✓ 仿真完成 ({step} 步)")
-
-    def _apply_cacc_parameters(self):
-        """
-        应用CACC参数优化
-
-        核心策略：
-        - sigma=0: 消除随机减速（完美驾驶），提高交通流稳定性
-        - tau=1.12: 微增跟车时距（抵消sigma=0带来的容量增加，保持安全性）
-
-        这个设置与训练环境完全一致，确保训练和推理的动作空间一致。
-        """
-        logger.info("✓ 应用CACC参数优化 (sigma=0, tau=1.12)")
-
-        cacc_applied = set()  # 跟踪已设置的车辆，避免重复设置
-        failed_vehicles = []  # 记录失败的车辆
-
-        try:
-            all_vehicles = traci.vehicle.getIDList()
-            logger.debug(f"开始应用CACC参数，车辆总数={len(all_vehicles)}")
-
-            for veh_id in all_vehicles:
-                if veh_id in cacc_applied:
-                    continue
-
-                try:
-                    # 只对CV（Connected Vehicle）类型应用CACC参数
-                    veh_type = traci.vehicle.getTypeID(veh_id)
-                    if veh_type == 'CV':
-                        # 设置imperfection（sigma）为0，消除随机减速
-                        traci.vehicle.setImperfection(veh_id, 0.0)
-
-                        # 设置tau（跟车时距）为1.12秒，略微增大以保持安全距离
-                        traci.vehicle.setTau(veh_id, 1.12)
-
-                        cacc_applied.add(veh_id)
-                except Exception as e:
-                    # 车辆可能在设置过程中离开路网，记录但不中断
-                    failed_vehicles.append((veh_id, str(e)))
-
-            logger.info(f"  已为 {len(cacc_applied)} 辆CV车辆应用CACC参数，失败 {len(failed_vehicles)} 辆")
-            if failed_vehicles and len(failed_vehicles) <= 5:
-                for veh_id, err in failed_vehicles[:5]:
-                    logger.debug(f"  车辆 {veh_id} 设置失败: {err}")
-
-        except Exception as e:
-            logger.error(f"  ⚠️  CACC参数设置过程中出现错误: {e}\n{tb.format_exc()}")
 
     def close(self):
         """关闭仿真"""

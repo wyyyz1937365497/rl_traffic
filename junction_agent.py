@@ -4,11 +4,22 @@
 """
 
 import os
+from vehicle_type_config import normalize_speed, get_vehicle_max_speed
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any
 from enum import Enum
 import numpy as np
+import logging
+import traceback as tb
+
+# 配置日志
+logger = logging.getLogger('junction_agent')
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 try:
     import libsumo as traci
@@ -524,25 +535,28 @@ class MultiAgentEnvironment:
     def reset(self) -> Dict[str, np.ndarray]:
         """重置环境"""
         self._start_sumo()
-        
+
         self.current_step = 0
-        
+
         # 重置智能体
         for agent in self.agents.values():
             agent.state_history.clear()
             agent.action_history.clear()
-        
+
         # 执行几步让车辆进入
         for _ in range(10):
             traci.simulationStep()
             self.current_step += 1
-        
+
+        # 应用CACC参数优化（与推理时保持一致）
+        self._apply_cacc_parameters()
+
         # 观察初始状态
         observations = {}
         for junc_id, agent in self.agents.items():
             state = agent.observe()
             observations[junc_id] = agent.get_state_vector(state)
-        
+
         return observations
     
     def step(self, actions: Dict[str, Dict]) -> Tuple[Dict[str, np.ndarray], Dict[str, float], bool, Dict]:
@@ -603,26 +617,108 @@ class MultiAgentEnvironment:
         
         traci.start(sumo_cmd)
         self.is_running = True
-    
+
+    def _apply_cacc_parameters(self):
+        """
+        应用CACC参数优化
+
+        核心策略：
+        - sigma=0: 消除随机减速（完美驾驶），提高交通流稳定性
+        - tau=1.12: 微增跟车时距（抵消sigma=0带来的容量增加，保持安全性）
+
+        这个设置与推理环境完全一致，确保训练和推理的动作空间一致。
+        """
+        cacc_applied = set()  # 跟踪已设置的车辆，避免重复设置
+        failed_vehicles = []  # 记录失败的车辆
+
+        try:
+            all_vehicles = traci.vehicle.getIDList()
+            logger.debug(f"开始应用CACC参数，车辆总数={len(all_vehicles)}")
+
+            for veh_id in all_vehicles:
+                if veh_id in cacc_applied:
+                    continue
+
+                try:
+                    # 只对CV（Connected Vehicle）类型应用CACC参数
+                    veh_type = traci.vehicle.getTypeID(veh_id)
+                    if veh_type == 'CV':
+                        # 设置imperfection（sigma）为0，消除随机减速
+                        traci.vehicle.setImperfection(veh_id, 0.0)
+
+                        # 设置tau（跟车时距）为1.12秒，略微增大以保持安全距离
+                        traci.vehicle.setTau(veh_id, 1.12)
+
+                        cacc_applied.add(veh_id)
+                except Exception as e:
+                    # 车辆可能在设置过程中离开路网，记录但不中断
+                    failed_vehicles.append((veh_id, str(e)))
+
+            logger.info(f"CACC参数应用完成: 成功={len(cacc_applied)}辆, 失败={len(failed_vehicles)}辆")
+            if failed_vehicles and len(failed_vehicles) <= 5:
+                for veh_id, err in failed_vehicles[:5]:
+                    logger.debug(f"  车辆 {veh_id} 设置失败: {err}")
+
+        except Exception as e:
+            logger.error(f"应用CACC参数时发生错误: {e}\n{tb.format_exc()}")
+
     def _apply_actions(self, actions: Dict[str, Dict]):
-        """应用动作"""
+        """
+        应用动作
+
+        改进：
+        1. 支持负值动作释放车辆控制（action < 0 时释放控制，交还SUMO）
+        2. 自动释放不在当前动作字典中的已控制车辆，防止控制泄漏
+        """
+        total_released = 0
+        total_controlled = 0
+        failed_actions = 0
+
         for junc_id, action_dict in actions.items():
             agent = self.agents.get(junc_id)
             if agent is None:
+                logger.warning(f"路口 {junc_id} 的agent不存在")
                 continue
-            
+
+            # 获取当前路口控制的车辆
+            controlled = agent.get_controlled_vehicles()
+            all_controlled = set()
+            for veh_list in controlled.values():
+                if veh_list:
+                    all_controlled.update(veh_list)
+
+            # 释放不在当前动作字典中的车辆（防止控制泄漏）
+            for veh_id in all_controlled:
+                if veh_id not in action_dict:
+                    try:
+                        traci.vehicle.setSpeed(veh_id, -1)  # -1表示交还SUMO自主控制
+                        total_released += 1
+                    except Exception as e:
+                        logger.debug(f"释放车辆 {veh_id} 失败: {e}")
+
+            # 应用当前动作
             for veh_id, action in action_dict.items():
                 try:
-                    # 动作值转换为速度
-                    # action范围: 0-1, 映射到速度范围
-                    current_speed = traci.vehicle.getSpeed(veh_id)
+                    # 特殊值：负数表示释放控制
+                    if action < 0:
+                        traci.vehicle.setSpeed(veh_id, -1)  # 交还SUMO自主控制
+                        total_released += 1
+                        continue
+
+                    # 正常动作：转换为速度
+                    # action范围: 0-1, 映射到速度范围 [0.3*limit, 1.2*limit]
                     speed_limit = 13.89  # 默认限速
-                    
                     target_speed = speed_limit * (0.3 + 0.9 * action)
                     traci.vehicle.setSpeed(veh_id, target_speed)
-                    
-                except:
-                    continue
+                    total_controlled += 1
+
+                except Exception as e:
+                    failed_actions += 1
+                    if failed_actions <= 3:  # 只记录前3个错误
+                        logger.debug(f"应用动作到车辆 {veh_id} 失败: {e}")
+
+        if total_released > 0 or total_controlled > 0:
+            logger.debug(f"动作应用: 控制={total_controlled}辆, 释放={total_released}辆, 失败={failed_actions}个")
     
     def _compute_rewards(self) -> Dict[str, float]:
         """计算每个智能体的奖励（完整版）"""

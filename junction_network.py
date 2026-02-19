@@ -21,12 +21,12 @@ from junction_agent import JunctionType
 class NetworkConfig:
     """网络配置"""
     # 类型A网络配置（单纯匝道汇入）
-    type_a_state_dim: int = 17
+    type_a_state_dim: int = 23  # 订阅模式：基础16 + 时间1 + 匝道汇入特征6（实际需要重新计算）
     type_a_hidden_dims: List[int] = None
     type_a_action_dim: int = 3
 
     # 类型B网络配置（匝道汇入+主路转出）
-    type_b_state_dim: int = 17
+    type_b_state_dim: int = 23  # 订阅模式：基础19 + 类型B特有3 + 时间1 = 23
     type_b_hidden_dims: List[int] = None
     type_b_action_dim: int = 4
     
