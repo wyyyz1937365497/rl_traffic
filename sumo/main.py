@@ -22,7 +22,8 @@ logger = logging.getLogger('sumo_main')
 # 添加父目录到路径以导入模型
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from junction_network import MultiJunctionModel, JUNCTION_CONFIGS
+from junction_network import MultiJunctionModel
+from junction_agent import JUNCTION_CONFIGS
 
 
 class SUMOCompetitionFramework:
@@ -167,9 +168,16 @@ class SUMOCompetitionFramework:
 
             print(f"✓ 模型已加载到 {self.device}")
 
-            # 创建智能体
-            for junc_id, config in JUNCTION_CONFIGS.items():
-                self.agents[junc_id] = RLAgent(junc_id, config, self.model, self.device)
+            # 创建智能体 - 将JunctionConfig转换为字典格式
+            for junc_id, junc_config in JUNCTION_CONFIGS.items():
+                # 转换为RLAgent期望的字典格式
+                config_dict = {
+                    'edges': {
+                        'main': junc_config.main_incoming,
+                        'ramp': junc_config.ramp_incoming
+                    }
+                }
+                self.agents[junc_id] = RLAgent(junc_id, config_dict, self.model, self.device)
 
             print(f"✓ 已创建 {len(self.agents)} 个RL智能体")
 
@@ -373,27 +381,29 @@ class SUMOCompetitionFramework:
         current_time = traci.simulation.getTime()
         current_vehicle_ids = traci.vehicle.getIDList()
 
-        # 统计出发和到达
-        departed = traci.simulation.getDepartedNumber()
-        arrived = traci.simulation.getArrivedNumber()
+        # 统计出发和到达（修复：使用累计统计）
+        step_departed = traci.simulation.getDepartedNumber()  # 当前步出发
+        step_arrived = traci.simulation.getArrivedNumber()    # 当前步到达
 
-        if departed > self.cumulative_departed:
+        # 累加到总数
+        self.cumulative_departed += step_departed
+        self.cumulative_arrived += step_arrived
+
+        # 获取新出发和到达的车辆ID
+        if step_departed > 0:
             new_departed = set(traci.simulation.getDepartedIDList())
             self.all_departed_vehicles.update(new_departed)
 
-        if arrived > self.cumulative_arrived:
+        if step_arrived > 0:
             new_arrived = set(traci.simulation.getArrivedIDList())
             self.all_arrived_vehicles.update(new_arrived)
-
-        self.cumulative_departed = departed
-        self.cumulative_arrived = arrived
 
         # 收集时间步级数据
         step_record = {
             'step': step,
             'time': current_time,
-            'departed': departed,
-            'arrived': arrived,
+            'departed': self.cumulative_departed,  # 使用累计值
+            'arrived': self.cumulative_arrived,    # 使用累计值
             'active_vehicles': len(current_vehicle_ids)
         }
 

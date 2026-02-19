@@ -17,7 +17,8 @@ import json
 # 添加父目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from .sumo.main import SUMOCompetitionFramework
+# 修复导入问题：使用绝对导入而不是相对导入
+from sumo.main import SUMOCompetitionFramework
 
 
 def setup_evaluation_logger(eval_dir):
@@ -74,7 +75,13 @@ def run_evaluation(model_path, sumo_cfg, iteration, eval_dir, device='cuda'):
         logger.info("\n[第三部分] 计算评估指标...")
         ocr_metrics = framework.calculate_ocr_metrics()
 
-        # 保存结果
+        # 保存pkl文件（用于比赛提交）
+        logger.info("\n[第四部分] 保存比赛提交文件...")
+        pkl_dir = os.path.join(eval_dir, f"iter_{iteration:04d}")
+        pkl_file = framework.save_to_pickle(output_dir=pkl_dir)
+        logger.info(f"✓ 比赛提交文件已保存: {pkl_file}")
+
+        # 保存JSON结果（用于训练监控）
         result_file = os.path.join(eval_dir, f"eval_iter_{iteration:04d}.json")
 
         result = {
@@ -105,7 +112,9 @@ def run_evaluation(model_path, sumo_cfg, iteration, eval_dir, device='cuda'):
         logger.info(f"  - 总出发车辆: {framework.cumulative_departed}")
         logger.info(f"  - 总到达车辆: {framework.cumulative_arrived}")
         logger.info(f"  - 完成率: {result['statistics']['completion_rate']:.2%}")
-        logger.info(f"\n💾 结果已保存: {result_file}")
+        logger.info(f"\n💾 文件已保存:")
+        logger.info(f"  - 比赛提交: {pkl_file}")
+        logger.info(f"  - 评估结果: {result_file}")
         logger.info("=" * 70)
 
         # 关闭SUMO

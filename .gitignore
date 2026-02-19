@@ -7,3 +7,4 @@ sumo/logs_parallel/
 .claude/
 tmp/
 logs/
+checkpoints\evaluations/
