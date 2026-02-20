@@ -339,32 +339,86 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
             return rewards
 
         def _compute_current_ocr(self) -> float:
-            """计算当前OCR"""
+            """
+            计算当前OCR（符合官方评测公式）
+
+            官方公式:
+            OCR = (N_arrived + Σ(d_i_traveled / d_i_total)) / N_total
+
+            其中:
+            - N_arrived: 已到达车辆数
+            - d_i_traveled: 在途车辆i已行驶的距离
+            - d_i_total: 在途车辆i的OD路径总长度
+            - N_total: 总车辆数（已到达 + 在途）
+            """
             try:
                 import traci
 
-                # 到达车辆数
-                arrived = traci.simulation.getArrivedNumber()
-
-                # 总车辆数
-                total = traci.vehicle.getIDCount()
-
-                if total == 0:
-                    return 0.0
+                # 已到达车辆数
+                n_arrived = traci.simulation.getArrivedNumber()
 
                 # 在途车辆完成度
-                inroute_completion = 0.0
+                enroute_completion = 0.0
                 for veh_id in traci.vehicle.getIDList():
                     try:
-                        route_idx = traci.vehicle.getRouteIndex(veh_id)
-                        route_len = len(traci.vehicle.getRoute(veh_id))
-                        if route_len > 0:
-                            inroute_completion += route_idx / route_len
-                    except:
+                        # 获取车辆已行驶距离
+                        current_edge = traci.vehicle.getRoadID(veh_id)
+                        current_position = traci.vehicle.getLanePosition(veh_id)
+                        route_edges = traci.vehicle.getRoute(veh_id)
+
+                        # 计算已行驶距离
+                        traveled_distance = 0.0
+                        for edge in route_edges:
+                            if edge == current_edge:
+                                # 当前边，加上当前位置
+                                traveled_distance += current_position
+                                break
+                            else:
+                                # 已通过的边，加上边全长
+                                try:
+                                    edge_length = traci.edge.getLength(edge)
+                                    traveled_distance += edge_length
+                                except:
+                                    # 如果边不存在，尝试获取车道长度
+                                    try:
+                                        lane_id = f"{edge}_0"
+                                        edge_length = traci.lane.getLength(lane_id)
+                                        traveled_distance += edge_length
+                                    except:
+                                        # 如果还是失败，使用默认值100m
+                                        traveled_distance += 100.0
+
+                        # 计算总路径长度
+                        total_distance = 0.0
+                        for edge in route_edges:
+                            try:
+                                edge_length = traci.edge.getLength(edge)
+                                total_distance += edge_length
+                            except:
+                                try:
+                                    lane_id = f"{edge}_0"
+                                    edge_length = traci.lane.getLength(lane_id)
+                                    total_distance += edge_length
+                                except:
+                                    total_distance += 100.0
+
+                        # 计算该车辆的完成度
+                        if total_distance > 0:
+                            completion_ratio = min(traveled_distance / total_distance, 1.0)
+                            enroute_completion += completion_ratio
+
+                    except Exception as e:
+                        # 如果某辆车计算失败，跳过
                         continue
 
-                # OCR = (到达 + 在途完成度) / 总数
-                ocr = (arrived + inroute_completion) / total
+                # 总车辆数 = 已到达 + 在途
+                n_total = n_arrived + len(traci.vehicle.getIDList())
+
+                if n_total == 0:
+                    return 0.0
+
+                # OCR = (已到达 + 在途车辆完成度之和) / 总车辆数
+                ocr = (n_arrived + enroute_completion) / n_total
                 return min(ocr, 1.0)
 
             except Exception as e:
@@ -571,8 +625,9 @@ def _get_vehicle_features(vehicle_ids, device):
     if not vehicle_ids:
         return None
 
+    MAX_VEHICLES = 300  # 最大车辆数
     features = []
-    for veh_id in vehicle_ids[:10]:
+    for veh_id in vehicle_ids[:MAX_VEHICLES]:
         try:
             features.append([
                 normalize_speed(traci_wrapper.vehicle.getSpeed(veh_id)),
@@ -590,6 +645,10 @@ def _get_vehicle_features(vehicle_ids, device):
 
     if not features:
         return None
+
+    # 填充到MAX_VEHICLES
+    while len(features) < MAX_VEHICLES:
+        features.append([0.0] * 8)
 
     return torch.tensor(features, dtype=torch.float32, device=device).unsqueeze(0)
 
@@ -847,6 +906,8 @@ def train(args):
             # ========== 保存检查点并启动异步评估 ==========
             # 每5次迭代保存一次检查点
             if (iteration + 1) % 5 == 0:
+                # 确保保存目录存在
+                os.makedirs(args.save_dir, exist_ok=True)
                 checkpoint_path = os.path.join(args.save_dir, f'checkpoint_iter_{iteration+1:04d}.pt')
                 torch.save(model.state_dict(), checkpoint_path)
                 tqdm.write(f"💾 检查点已保存: {checkpoint_path}\n")
@@ -892,7 +953,7 @@ def main():
     parser.add_argument('--sumo-cfg', type=str, required=True, help='SUMO配置文件')
     parser.add_argument('--total-timesteps', type=int, default=1000000, help='总训练步数')
     parser.add_argument('--lr', type=float, default=3e-4, help='学习率')
-    parser.add_argument('--batch-size', type=int, default=2048, help='批大小')
+    parser.add_argument('--batch-size', type=int, default=8192, help='批大小')
     parser.add_argument('--num-envs', type=int, default=4, help='并行环境数量')
     parser.add_argument('--workers', type=int, help='工作进程数（默认=CPU核心数）')
     parser.add_argument('--update-frequency', type=int, default=2048, help='更新频率')

@@ -24,12 +24,12 @@ class ImprovedRewardCalculator:
         # ===== 重新设计：专注于实时可观测指标的奖励权重 =====
         self.weights = {
             # ===== 正向奖励（实时有效）=====
-            'vehicle_departure': 0.5,        # 车辆离开奖励（每辆离开控制区）
-            'flow_maintenance': 1.5,         # 流量保持奖励（主路和匝道都有流动）
-            'speed_maintenance': 1.0,        # 速度维持奖励（保持较高速度）
-            'gap_utilization': 3.0,          # 间隙利用奖励（匝道车辆成功利用间隙）
-            'no_stops': 0.5,                 # 无停车奖励（车辆不停车）
-            'capacity_bonus': 2.0,           # 通行能力奖励（多车辆同时通过）
+            'vehicle_departure': 0.3,        # 车辆离开奖励（每辆离开控制区）
+            'flow_maintenance': 1.0,         # 流量保持奖励（主路和匝道都有流动）
+            'speed_maintenance': 0.5,        # 速度维持奖励（保持较高速度）
+            'gap_utilization': 1.5,          # 间隙利用奖励（匝道车辆成功利用间隙）
+            'no_stops': 0.3,                 # 无停车奖励（车辆不停车）
+            'capacity_bonus': 1.0,           # 通行能力奖励（多车辆同时通过）
 
             # ===== 期末奖励（episode结束时）=====
             'ocr_final': 100.0,              # 最终OCR奖励（episode结束时一次性）
@@ -43,7 +43,7 @@ class ImprovedRewardCalculator:
         }
 
         # 奖励裁剪范围
-        self.reward_clip_range = (-5.0, 5.0)  # 缩小裁剪范围，因为现在都是小奖励
+        self.reward_clip_range = (-10.0, 10.0)  # 扩大裁剪范围，提供更多学习空间
 
         # Episode追踪
         self.episode_throughput = defaultdict(int)  # 累计通过量

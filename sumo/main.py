@@ -343,8 +343,9 @@ class SUMOCompetitionFramework:
 
     def _apply_rl_control(self, step):
         """使用RL模型进行控制（可选功能）"""
-        if step < 10:
-            return
+        # 移除 step < 10 的限制，让模型从第一步就开始控制
+        # if step < 10:
+        #     return
 
         try:
             # 收集所有智能体的观察
@@ -358,6 +359,12 @@ class SUMOCompetitionFramework:
                 # 使用 observe() 更新状态
                 state = agent.observe()
                 if state is not None:
+                    # 调试：打印车辆信息
+                    if step % 100 == 0 and step > 0:
+                        cv_main = len(state.cv_vehicles_main)
+                        cv_ramp = len(state.cv_vehicles_ramp)
+                        print(f"[{junc_id}] 主路CV: {cv_main}, 匝道CV: {cv_ramp}, 总车辆: {len(state.main_vehicles)+len(state.ramp_vehicles)}")
+
                     # 使用 agent.get_state_vector() 获取标准化的状态向量
                     import torch
                     state_vec = torch.tensor(
@@ -385,17 +392,21 @@ class SUMOCompetitionFramework:
             # 应用控制动作
             self._apply_actions(actions)
 
+            # 调试：每100步打印一次控制信息
+            if step % 100 == 0 and step > 0:
+                print(f"[RL控制] 步骤 {step}: 已应用 {len(actions)} 个路口的控制")
+
         except Exception as e:
             import traceback
+            print(f"[RL控制错误] 步骤 {step}: {e}")
             traceback.print_exc()
-            pass
 
     def _get_vehicle_features(self, vehicle_ids):
         """
         将车辆ID列表转换为特征tensor（与训练代码一致）
 
         特征维度（8个）:
-        1. normalize_speed(speed)
+        1. speed / 20.0
         2. position / 500
         3. lane_index / 3
         4. waiting_time / 60
@@ -410,8 +421,7 @@ class SUMOCompetitionFramework:
             # 返回空tensor
             return None
 
-        MAX_VEHICLES = 10  # 最多10辆车
-        GLOBAL_MAX_SPEED = 55.5556  # 全局最大速度
+        MAX_VEHICLES = 300  # 最多300辆车
 
         features = []
         for veh_id in vehicle_ids[:MAX_VEHICLES]:
@@ -424,9 +434,9 @@ class SUMOCompetitionFramework:
                 vtype = traci.vehicle.getTypeID(veh_id)
                 route_index = traci.vehicle.getRouteIndex(veh_id)
 
-                # 归一化特征
+                # 归一化特征（与训练代码一致）
                 features.append([
-                    min(speed / GLOBAL_MAX_SPEED, 1.0),  # normalize_speed
+                    speed / 20.0,           # 与训练代码一致
                     position / 500.0,
                     lane_index / 3.0,
                     waiting_time / 60.0,
@@ -447,7 +457,9 @@ class SUMOCompetitionFramework:
         return torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(self.device)
 
     def _apply_actions(self, actions):
-        """应用模型输出的动作"""
+        """应用模型输出的动作（只控制CV车辆，符合比赛规定）"""
+        total_controlled = 0
+
         for junc_id, action in actions.items():
             if junc_id not in self.agents:
                 continue
@@ -455,27 +467,39 @@ class SUMOCompetitionFramework:
             agent = self.agents[junc_id]
             controlled = agent.get_controlled_vehicles()
 
+            # 控制主路CV车辆
             if controlled['main'] and 'main' in action:
-                for veh_id in controlled['main'][:1]:
+                for veh_id in controlled['main'][:5]:
                     try:
                         action_value = action['main'].item()
                         speed_limit = 13.89
                         target_speed = speed_limit * (0.3 + 0.9 * action_value)
                         target_speed = max(0.0, min(target_speed, speed_limit * 1.2))
                         traci.vehicle.setSpeed(veh_id, target_speed)
+                        total_controlled += 1
                     except Exception as e:
+                        print(f"[控制失败] {junc_id} main {veh_id}: {e}")
                         continue
 
+            # 控制匝道CV车辆
             if controlled['ramp'] and 'ramp' in action:
-                for veh_id in controlled['ramp'][:1]:
+                for veh_id in controlled['ramp'][:3]:
                     try:
                         action_value = action['ramp'].item()
                         speed_limit = 13.89
                         target_speed = speed_limit * (0.3 + 0.9 * action_value)
                         target_speed = max(0.0, min(target_speed, speed_limit * 1.2))
                         traci.vehicle.setSpeed(veh_id, target_speed)
+                        total_controlled += 1
                     except Exception as e:
+                        print(f"[控制失败] {junc_id} ramp {veh_id}: {e}")
                         continue
+
+        # 调试：打印控制的车辆总数
+        if total_controlled > 0:
+            print(f"[应用控制] 本次控制了 {total_controlled} 辆CV车")
+        elif total_controlled == 0 and len(actions) > 0:
+            print(f"[警告] 没有CV车辆被控制！检查场景配置")
 
     # ========================================================================
     # 第三部分: 数据收集与统计

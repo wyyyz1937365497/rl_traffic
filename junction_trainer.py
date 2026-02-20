@@ -237,8 +237,9 @@ class MultiAgentPPOTrainer:
         if not vehicle_ids:
             return None
 
+        MAX_VEHICLES = 300  # 最大车辆数
         features = []
-        for veh_id in vehicle_ids[:10]:  # 最多10辆
+        for veh_id in vehicle_ids[:MAX_VEHICLES]:
             try:
                 # 使用全局traci（订阅模式）
                 import traci
@@ -259,6 +260,10 @@ class MultiAgentPPOTrainer:
 
         if not features:
             return None
+
+        # 填充到MAX_VEHICLES
+        while len(features) < MAX_VEHICLES:
+            features.append([0.0] * 8)
 
         return torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
     
@@ -674,42 +679,87 @@ class MultiAgentPPOTrainer:
         return total_ocr / n_episodes
     
     def _compute_episode_ocr(self, env: MultiAgentEnvironment) -> float:
-        """计算回合OCR（完整版）"""
+        """
+        计算回合OCR（符合官方评测公式）
+
+        官方公式:
+        OCR = (N_arrived + Σ(d_i_traveled / d_i_total)) / N_total
+
+        其中:
+        - N_arrived: 已到达车辆数
+        - d_i_traveled: 在途车辆i已行驶的距离
+        - d_i_total: 在途车辆i的OD路径总长度
+        - N_total: 总车辆数（已到达 + 在途）
+        """
         try:
             # 使用全局traci（订阅模式）
             import traci
 
             # 1. 获取到达车辆数
-            arrived = traci.simulation.getArrivedNumber()
+            n_arrived = traci.simulation.getArrivedNumber()
 
-            # 2. 获取出发车辆数
-            departed = traci.simulation.getDepartedNumber()
-
-            # 3. 计算在途车辆的完成度
-            inroute_completion = 0.0
-            total_vehicles = traci.vehicle.getCount()
-
+            # 2. 计算在途车辆的完成度
+            enroute_completion = 0.0
             for veh_id in traci.vehicle.getIDList():
                 try:
-                    # 获取路径进度
-                    route_idx = traci.vehicle.getRouteIndex(veh_id)
-                    route = traci.vehicle.getRoute(veh_id)
-                    route_len = len(route)
+                    # 获取车辆已行驶距离
+                    current_edge = traci.vehicle.getRoadID(veh_id)
+                    current_position = traci.vehicle.getLanePosition(veh_id)
+                    route_edges = traci.vehicle.getRoute(veh_id)
 
-                    if route_len > 0:
-                        # 完成度 = 当前路径索引 / 总路径长度
-                        completion = route_idx / route_len
-                        inroute_completion += completion
+                    # 计算已行驶距离
+                    traveled_distance = 0.0
+                    for edge in route_edges:
+                        if edge == current_edge:
+                            # 当前边，加上当前位置
+                            traveled_distance += current_position
+                            break
+                        else:
+                            # 已通过的边，加上边全长
+                            try:
+                                edge_length = traci.edge.getLength(edge)
+                                traveled_distance += edge_length
+                            except:
+                                # 如果边不存在，尝试获取车道长度
+                                try:
+                                    lane_id = f"{edge}_0"
+                                    edge_length = traci.lane.getLength(lane_id)
+                                    traveled_distance += edge_length
+                                except:
+                                    # 如果还是失败，使用默认值100m
+                                    traveled_distance += 100.0
+
+                    # 计算总路径长度
+                    total_distance = 0.0
+                    for edge in route_edges:
+                        try:
+                            edge_length = traci.edge.getLength(edge)
+                            total_distance += edge_length
+                        except:
+                            try:
+                                lane_id = f"{edge}_0"
+                                edge_length = traci.lane.getLength(lane_id)
+                                total_distance += edge_length
+                            except:
+                                total_distance += 100.0
+
+                    # 计算该车辆的完成度
+                    if total_distance > 0:
+                        completion_ratio = min(traveled_distance / total_distance, 1.0)
+                        enroute_completion += completion_ratio
+
                 except Exception as e:
                     print(f"获取车辆 {veh_id} 路径完成度失败: {e}")
                     continue
 
-            # 4. 计算OCR
-            # OCR = (到达车辆数 + 在途车辆完成度之和) / 总出发车辆数
-            if total_vehicles == 0 and arrived == 0:
+            # 3. 总车辆数 = 已到达 + 在途
+            n_total = n_arrived + len(traci.vehicle.getIDList())
+
+            if n_total == 0:
                 return 0.0
 
-            ocr = (arrived + inroute_completion) / max(departed, 1)
+            # 4. OCR = (已到达 + 在途车辆完成度之和) / 总车辆数
+            ocr = (n_arrived + enroute_completion) / n_total
 
             return min(ocr, 1.0)  # 限制在[0, 1]
 

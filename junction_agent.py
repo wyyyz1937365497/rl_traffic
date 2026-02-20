@@ -737,7 +737,7 @@ class JunctionAgent:
                         'edge': edge_id,
                         'waiting_time': veh_data.get(tc.VAR_WAITING_TIME, 0),
                         'accel': veh_data.get(tc.VAR_ACCELERATION, 0),
-                        'is_cv': veh_data.get(tc.VAR_VEHICLECLASS, '') == 'CV',
+                        'is_cv': veh_data.get(tc.VAR_TYPE, '') == 'CV',
                         'route_index': veh_data.get(tc.VAR_ROUTE_INDEX, 0)
                     }
                     vehicles.append(veh_info)

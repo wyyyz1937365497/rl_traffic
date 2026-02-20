@@ -1,0 +1,11 @@
+{
+  "iteration": 0,
+  "timestamp": "2026-02-20T21:23:43.184292",
+  "model_path": ".\\checkpoints\\final_model.pt",
+  "statistics": {
+    "total_departed": 4884,
+    "total_arrived": 4608,
+    "completion_rate": 0.9434889434889435
+  },
+  "pickle_file": "competition_results\\iter_0000\\competition_submission.pkl"
+}

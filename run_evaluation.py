@@ -74,7 +74,7 @@ def run_single_evaluation(model_path, iteration, eval_dir, device='cuda', max_st
     cmd = [
         'python', 'evaluate_model_compliant.py',
         '--model-path', model_path,
-        '--sumo-cfg', 'sumo/sumoff.sumocfg',
+        '--sumo-cfg', 'sumo/sumo.sumocfg',
         '--iteration', str(iteration),
         '--eval-dir', eval_dir,
         '--device', device,
