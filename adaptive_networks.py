@@ -97,36 +97,35 @@ class SimpleMergeNetwork(nn.Module):
     特点：轻量级，快速响应
     """
     
-    def __init__(self, state_dim: int = 22):
+    def __init__(self, state_dim: int = 23):
         super().__init__()
-        
-        # 轻量级状态编码器
+
+        # 轻量级状态编码器（输出64维以兼容其他网络）
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32)
+            nn.ReLU()
         )
-        
+
         # 简单注意力
         self.attention = nn.MultiheadAttention(16, 2, batch_first=True)
-        
+
         # 控制头
         self.main_control = nn.Sequential(
-            nn.Linear(32 + 16, 16),
+            nn.Linear(64 + 16, 32),
             nn.ReLU(),
-            nn.Linear(16, 11)
+            nn.Linear(32, 11)
         )
-        
+
         self.ramp_control = nn.Sequential(
-            nn.Linear(32 + 16, 16),
+            nn.Linear(64 + 16, 32),
             nn.ReLU(),
-            nn.Linear(16, 11)
+            nn.Linear(32, 11)
         )
-        
+
         # 价值头
-        self.value_head = nn.Linear(32, 1)
+        self.value_head = nn.Linear(64, 1)
     
-    def forward(self, state, main_vehicles=None, ramp_vehicles=None):
+    def forward(self, state, main_vehicles=None, ramp_vehicles=None, **kwargs):
         # 编码状态
         state_feat = self.state_encoder(state)
         
@@ -161,7 +160,7 @@ class ComplexMergeDivergeNetwork(nn.Module):
     特点：三方协调，精细控制
     """
     
-    def __init__(self, state_dim: int = 22):
+    def __init__(self, state_dim: int = 23):
         super().__init__()
         
         # 深层状态编码器
@@ -214,7 +213,7 @@ class ComplexMergeDivergeNetwork(nn.Module):
             nn.Linear(32, 1)
         )
     
-    def forward(self, state, main_vehicles=None, ramp_vehicles=None, diverge_vehicles=None):
+    def forward(self, state, main_vehicles=None, ramp_vehicles=None, diverge_vehicles=None, **kwargs):
         batch_size = state.size(0)
         device = state.device
         
@@ -264,7 +263,7 @@ class HighConflictNetwork(nn.Module):
     特点：冲突预测，保守策略
     """
     
-    def __init__(self, state_dim: int = 22):
+    def __init__(self, state_dim: int = 23):
         super().__init__()
         
         # 深层状态编码器
@@ -327,7 +326,7 @@ class HighConflictNetwork(nn.Module):
             nn.Linear(32, 1)
         )
     
-    def forward(self, state, main_vehicles=None, ramp_vehicles=None, diverge_vehicles=None):
+    def forward(self, state, main_vehicles=None, ramp_vehicles=None, diverge_vehicles=None, **kwargs):
         batch_size = state.size(0)
         device = state.device
         

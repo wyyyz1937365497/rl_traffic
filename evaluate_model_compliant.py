@@ -9,6 +9,17 @@
 
 import os
 import sys
+
+# 设置控制台编码为UTF-8（Windows兼容）
+if sys.platform == 'win32':
+    import locale
+    if sys.stdout.encoding != 'utf-8':
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stderr.reconfigure(encoding='utf-8')
+        except:
+            pass
+
 import argparse
 import logging
 import traceback as tb

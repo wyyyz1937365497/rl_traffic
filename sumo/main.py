@@ -102,7 +102,7 @@ class SUMOCompetitionFramework:
         if time_step is not None:
             self.step_length = float(time_step.get('value', 1.0))
 
-        print(f"✓ 配置解析完成:")
+        print(f"[OK] 配置解析完成:")
         print(f"  - 网络文件: {self.net_file}")
         print(f"  - 路径文件: {self.routes_file}")
         print(f"  - 时间步长: {self.step_length}s")
@@ -110,7 +110,7 @@ class SUMOCompetitionFramework:
     def parse_routes(self):
         """解析路径文件,计算车流量和总需求,并记录原始maxSpeed配置"""
         if not self.routes_file or not os.path.exists(self.routes_file):
-            print("⚠️  路径文件不存在,无法计算理论需求")
+            print("[WARNING]  路径文件不存在,无法计算理论需求")
             return
 
         try:
@@ -150,7 +150,7 @@ class SUMOCompetitionFramework:
             self.flow_rate = total_vehs_per_hour / 3600.0
             self.total_demand = total_demand
 
-            print(f"✓ 交通需求分析:")
+            print(f"[OK] 交通需求分析:")
             print(f"  - 流量率: {self.flow_rate:.4f} veh/s")
             print(f"  - 仿真时长: {self.simulation_time:.2f} s")
             print(f"  - 理论总需求: {self.total_demand:.0f} 车辆")
@@ -158,7 +158,7 @@ class SUMOCompetitionFramework:
             print(f"  - 记录车辆类型数: {len(self.vehicle_type_maxspeed)}")
 
         except Exception as e:
-            print(f"❌ 路径文件解析失败: {e}")
+            print(f"[ERROR] 路径文件解析失败: {e}")
 
     def initialize_traffic_lights(self):
         """初始化红绿灯监控"""
@@ -169,15 +169,15 @@ class SUMOCompetitionFramework:
                 if tl_id in all_tls:
                     self.available_traffic_lights.append(tl_id)
                 else:
-                    print(f"⚠️  红绿灯 {tl_id} 不存在于当前网络中")
+                    print(f"[WARNING]  红绿灯 {tl_id} 不存在于当前网络中")
 
-            print(f"✓ 红绿灯监控设置:")
+            print(f"[OK] 红绿灯监控设置:")
             print(f"  - 目标红绿灯: {self.traffic_lights}")
             print(f"  - 可用红绿灯: {self.available_traffic_lights}")
             print(f"  - 全部红绿灯: {list(all_tls)}")
 
         except Exception as e:
-            print(f"❌ 红绿灯初始化失败: {e}")
+            print(f"[ERROR] 红绿灯初始化失败: {e}")
             self.available_traffic_lights = []
 
     def load_rl_model(self, model_path, device='cuda'):
@@ -192,43 +192,51 @@ class SUMOCompetitionFramework:
             device: 设备 ('cuda' or 'cpu')
         """
         if not TORCH_AVAILABLE:
-            print("⚠️  PyTorch未安装，无法加载RL模型")
+            print("[WARNING]  PyTorch未安装，无法加载RL模型")
             return False
 
         try:
             # 导入必要的模块
             from junction_network import create_junction_model, NetworkConfig
-            from junction_agent import JUNCTION_CONFIGS, RLAgent
+            from junction_agent import JUNCTION_CONFIGS, JunctionAgent, SubscriptionManager
 
             # 设置设备
             self.device = device if torch.cuda.is_available() else 'cpu'
 
-            # 创建模型
-            self.model = create_junction_model(NetworkConfig())
+            # 创建模型 - 使用JUNCTION_CONFIGS
+            self.model = create_junction_model(JUNCTION_CONFIGS, NetworkConfig())
             checkpoint = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+
+            # 支持两种checkpoint格式
+            if isinstance(checkpoint, dict):
+                # 格式1: {'model_state_dict': ..., ...}
+                if 'model_state_dict' in checkpoint:
+                    self.model.load_state_dict(checkpoint['model_state_dict'])
+                # 格式2: 直接是state_dict
+                else:
+                    self.model.load_state_dict(checkpoint)
+            else:
+                # 格式3: 直接是state_dict
+                self.model.load_state_dict(checkpoint)
+
             self.model.to(self.device)
             self.model.eval()
 
             # 创建智能体
+            import traci
             for junc_id, junc_config in JUNCTION_CONFIGS.items():
-                # 转换为RLAgent期望的字典格式
-                config_dict = {
-                    'edges': {
-                        'main': junc_config.main_incoming,
-                        'ramp': junc_config.ramp_incoming
-                    }
-                }
-                self.agents[junc_id] = RLAgent(junc_id, config_dict, self.model, self.device)
+                sub_manager = SubscriptionManager(junc_id)
+                sub_manager.setup_subscriptions()
+                self.agents[junc_id] = JunctionAgent(junc_config, sub_manager)
 
             self.model_loaded = True
-            print(f"✓ RL模型已加载: {model_path}")
+            print(f"[OK] RL模型已加载: {model_path}")
             print(f"  设备: {self.device}")
             print(f"  智能体数量: {len(self.agents)}")
             return True
 
         except Exception as e:
-            print(f"⚠️  模型加载失败: {e}")
+            print(f"[WARNING]  模型加载失败: {e}")
             print("  将运行Baseline模式（无模型控制）")
             self.model_loaded = False
             return False
@@ -252,15 +260,15 @@ class SUMOCompetitionFramework:
 
         try:
             traci.start(sumo_cmd)
-            print(f"✓ SUMO启动成功 (模式: {'GUI' if use_gui else 'CLI'})")
+            print(f"[OK] SUMO启动成功 (模式: {'GUI' if use_gui else 'CLI'})")
         except Exception as e:
-            print(f"❌ SUMO启动失败: {e}")
+            print(f"[ERROR] SUMO启动失败: {e}")
             return False
 
         # 初始化红绿灯
         self.initialize_traffic_lights()
 
-        print("✓ Baseline环境初始化完成!\n")
+        print("[OK] Baseline环境初始化完成!\n")
         return True
 
     # ========================================================================
@@ -342,12 +350,30 @@ class SUMOCompetitionFramework:
             vehicle_obs = {}
 
             for junc_id, agent in self.agents.items():
-                obs = agent.observe(traci)
-                if obs is not None:
-                    obs_tensors[junc_id] = obs
-                    vehicle_obs[junc_id] = agent.get_vehicle_features(
-                        agent.get_controlled_vehicles(), traci, self.device
-                    )
+                # observe() 不接受参数
+                state = agent.observe()
+                if state is not None:
+                    # 将JunctionState转换为tensor
+                    import torch
+                    state_vec = torch.tensor([
+                        len(state.main_vehicles),  # 主路车辆数
+                        state.main_speed,
+                        state.main_density,
+                        state.main_queue_length,
+                        len(state.ramp_vehicles),  # 匝道车辆数
+                        state.ramp_speed,
+                        state.ramp_queue_length,
+                        state.current_phase if state.current_phase is not None else 0
+                    ], dtype=torch.float32).unsqueeze(0).to(self.device)
+
+                    obs_tensors[junc_id] = state_vec
+
+                    # 获取受控车辆特征
+                    controlled = agent.get_controlled_vehicles()
+                    vehicle_obs[junc_id] = {
+                        'main': self._get_vehicle_tensor(controlled.get('main', [])),
+                        'ramp': self._get_vehicle_tensor(controlled.get('ramp', []))
+                    }
 
             if not obs_tensors:
                 return
@@ -360,7 +386,30 @@ class SUMOCompetitionFramework:
             self._apply_actions(actions)
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             pass
+
+    def _get_vehicle_tensor(self, vehicle_ids):
+        """将车辆ID列表转换为特征tensor"""
+        import torch
+        if not vehicle_ids:
+            return None
+
+        features = []
+        for veh_id in vehicle_ids[:5]:  # 最多5辆车
+            try:
+                speed = traci.vehicle.getSpeed(veh_id)
+                accel = traci.vehicle.getAcceleration(veh_id)
+                features.append([speed, accel])
+            except:
+                features.append([0.0, 0.0])
+
+        # 填充到5辆车
+        while len(features) < 5:
+            features.append([0.0, 0.0])
+
+        return torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(self.device)
 
     def _apply_actions(self, actions):
         """应用模型输出的动作"""
@@ -652,12 +701,12 @@ class SUMOCompetitionFramework:
         print(f"\n{'=' * 70}")
         print(f"数据保存统计")
         print(f"{'=' * 70}")
-        print(f"✓ Pickle文件已保存: {pickle_file}")
+        print(f"[OK] Pickle文件已保存: {pickle_file}")
         print(f"  - 文件大小: {file_size:.2f} MB")
         print(f"  - 时间步数据记录: {len(self.step_data):,} 条")
         print(f"  - 车辆数据记录: {len(self.vehicle_data):,} 条")
         print(f"  - 唯一车辆数: {len(self.route_data):,} 辆")
-        print(f"\n✓ 汇总JSON已保存: {summary_file}")
+        print(f"\n[OK] 汇总JSON已保存: {summary_file}")
         print(f"{'=' * 70}")
 
         # 数据统计报告
@@ -695,7 +744,7 @@ class SUMOCompetitionFramework:
 
         # 第一部分: 初始化Baseline环境
         if not self.initialize_environment(use_gui=use_gui, max_steps=max_steps):
-            print("❌ 环境初始化失败")
+            print("[ERROR] 环境初始化失败")
             return False
 
         # 仿真主循环
@@ -723,7 +772,7 @@ class SUMOCompetitionFramework:
                     break
 
         except Exception as e:
-            print(f"\n❌ 仿真过程中发生错误: {e}")
+            print(f"\n[ERROR] 仿真过程中发生错误: {e}")
             import traceback
             traceback.print_exc()
 
@@ -765,7 +814,7 @@ def load_pickle_data(pickle_file):
     with open(pickle_file, 'rb') as f:
         data_package = pickle.load(f)
 
-    print(f"✓ 数据加载成功!")
+    print(f"[OK] 数据加载成功!")
     print(f"  - 参数: {len(data_package['parameters'])} 项")
     print(f"  - 时间步数据: {len(data_package['step_data']):,} 条")
     print(f"  - 车辆数据: {len(data_package['vehicle_data']):,} 条")
@@ -857,14 +906,14 @@ def export_to_csv(pickle_file, output_dir=None):
         step_csv = os.path.join(output_dir, f"step_data_{timestamp}.csv")
         step_df = pd.DataFrame(data['step_data'])
         step_df.to_csv(step_csv, index=False, encoding='utf-8-sig')
-        print(f"✓ 时间步数据已导出: {step_csv}")
+        print(f"[OK] 时间步数据已导出: {step_csv}")
 
     # 导出车辆数据
     if data['vehicle_data']:
         vehicle_csv = os.path.join(output_dir, f"vehicle_data_{timestamp}.csv")
         vehicle_df = pd.DataFrame(data['vehicle_data'])
         vehicle_df.to_csv(vehicle_csv, index=False, encoding='utf-8-sig')
-        print(f"✓ 车辆数据已导出: {vehicle_csv}")
+        print(f"[OK] 车辆数据已导出: {vehicle_csv}")
 
     # 导出参数
     params_csv = os.path.join(output_dir, f"parameters_{timestamp}.csv")
@@ -873,7 +922,7 @@ def export_to_csv(pickle_file, output_dir=None):
         for k, v in data['parameters'].items()
     ])
     params_df.to_csv(params_csv, index=False, encoding='utf-8-sig')
-    print(f"✓ 参数已导出: {params_csv}")
+    print(f"[OK] 参数已导出: {params_csv}")
 
 
 def main():
@@ -898,7 +947,7 @@ def main():
 
     # 检查配置文件是否存在
     if not os.path.exists(sumo_cfg):
-        print(f"❌ 配置文件不存在: {sumo_cfg}")
+        print(f"[ERROR] 配置文件不存在: {sumo_cfg}")
         print("\n请修改main()函数中的sumo_cfg路径,或使用命令行参数:")
         print(f"python {sys.argv[0]} <your_config_file.sumocfg>")
         return
@@ -911,7 +960,7 @@ def main():
         framework.run(max_steps=MAX_STEPS, use_gui=USE_GUI)
 
     except Exception as e:
-        print(f"\n❌ 程序运行失败: {e}")
+        print(f"\n[ERROR] 程序运行失败: {e}")
         import traceback
         traceback.print_exc()
 

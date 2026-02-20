@@ -11,6 +11,32 @@ import pickle
 from datetime import datetime
 from typing import Dict, List, Optional
 
+# ===== OD信息辅助函数 =====
+
+def get_vehicle_origin(veh_id: str, veh_state) -> str:
+    """获取车辆起点"""
+    try:
+        import traci
+        route = traci.vehicle.getRoute(veh_id)
+        if route and len(route) > 0:
+            return route[0]
+    except:
+        pass
+    return veh_state.edge_id if veh_state else ''
+
+def get_vehicle_destination(veh_id: str, veh_state) -> str:
+    """获取车辆终点"""
+    try:
+        import traci
+        route = traci.vehicle.getRoute(veh_id)
+        if route and len(route) > 0:
+            return route[-1]
+    except:
+        pass
+    return ''
+
+
+
 import numpy as np
 import torch
 
@@ -240,8 +266,8 @@ def run_inference(args):
                 'position': veh_state.position.tolist(),
                 'edge_id': veh_state.edge_id,
                 'completion_rate': veh_state.completion_rate,
-                'origin': veh_state.edge_id,  # 简化
-                'destination': '',  # 需要从路径获取
+                'origin': get_vehicle_origin(veh_id, veh_state),
+                'destination': get_vehicle_destination(veh_id, veh_state)
                 'vehicle_type': 'CV' if veh_state.is_cv else 'HV'
             })
         

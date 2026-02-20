@@ -774,13 +774,24 @@ class TrafficEnvironment:
         
         # 道路之间的连接关系（基于路网拓扑）
         for i, edge_id in enumerate(edge_nodes):
-            # 这里简化处理，实际可以从路网文件获取
+            # 修复：使用硬编码拓扑
+            from road_topology_hardcoded import are_edges_connected, get_edge_connection_type
+            
             for j, other_edge_id in enumerate(edge_nodes):
                 if edge_id != other_edge_id:
-                    # 检查是否相邻
-                    if edge_id.startswith('-') and other_edge_id == edge_id[1:]:
+                    # 使用硬编码拓扑检查连接
+                    if are_edges_connected(edge_id, other_edge_id):
                         edge_index.append([len(vehicle_nodes) + i, len(vehicle_nodes) + j])
-                        edge_attr.append([0.5, 0.0])
+                        
+                        # 获取连接类型
+                        conn_type = get_edge_connection_type(edge_id, other_edge_id)
+                        type_encoding = {
+                            'through': [1.0, 0.0, 0.0, 0.0],
+                            'merge': [0.0, 1.0, 0.0, 0.0],
+                            'diverge': [0.0, 0.0, 1.0, 0.0],
+                            'none': [0.0, 0.0, 0.0, 0.0]
+                        }
+                        edge_attr.append(type_encoding.get(conn_type, [0.0, 0.0, 0.0, 0.0]))
         
         edge_index = np.array(edge_index, dtype=np.int64).T if edge_index else np.zeros((2, 0), dtype=np.int64)
         edge_attr = np.array(edge_attr, dtype=np.float32) if edge_attr else np.zeros((0, 2), dtype=np.float32)

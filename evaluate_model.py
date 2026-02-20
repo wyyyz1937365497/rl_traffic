@@ -37,7 +37,7 @@ def setup_evaluation_logger(eval_dir):
     return logging.getLogger('evaluation')
 
 
-def run_evaluation(model_path, sumo_cfg, iteration, eval_dir, device='cuda'):
+def run_evaluation(model_path, sumo_cfg, iteration, eval_dir, device='cuda', max_steps=3600):
     """
     运行比赛级别评估
 
@@ -47,80 +47,121 @@ def run_evaluation(model_path, sumo_cfg, iteration, eval_dir, device='cuda'):
         iteration: 当前迭代次数
         eval_dir: 评估结果保存目录
         device: 设备 ('cuda' or 'cpu')
+        max_steps: 最大仿真步数
     """
     logger = logging.getLogger('evaluation')
 
     logger.info("=" * 70)
     logger.info(f"开始评估 - 迭代 {iteration}")
     logger.info("=" * 70)
+    logger.info("重要提醒: 此评估不修改SUMO配置，符合比赛要求")
 
     try:
         # 创建框架实例
-        framework = SUMOCompetitionFramework(
-            sumo_cfg_path=sumo_cfg,
-            model_path=model_path
-        )
+        framework = SUMOCompetitionFramework(sumo_cfg)
 
-        # 初始化
+        # 第一部分: 初始化Baseline环境
+        logger.info("\n[第一步] 初始化环境...")
         framework.parse_config()
         framework.parse_routes()
-        framework.initialize_environment()
-        framework.load_rl_model()
 
-        # 运行仿真
-        logger.info("\n[第二部分] 开始仿真...")
-        framework.run_simulation()
+        # 启动SUMO（不使用GUI，加快速度）
+        sumo_binary = "sumo"
+        sumo_cmd = [
+            sumo_binary,
+            "-c", sumo_cfg,
+            "--no-warnings", "true",
+            "--duration-log.statistics", "true"
+        ]
 
-        # 计算OCR指标
-        logger.info("\n[第三部分] 计算评估指标...")
-        ocr_metrics = framework.calculate_ocr_metrics()
+        import traci
+        traci.start(sumo_cmd)
+        logger.info("SUMO已启动")
 
-        # 保存pkl文件（用于比赛提交）
-        logger.info("\n[第四部分] 保存比赛提交文件...")
+        framework.initialize_traffic_lights()
+
+        # 第二步: 加载RL模型（不修改配置）
+        logger.info(f"\n[第二步] 加载RL模型...")
+        logger.info(f"模型路径: {model_path}")
+        framework.load_rl_model(model_path, device=device)
+
+        if not framework.model_loaded:
+            logger.warning("模型加载失败，将运行Baseline模式")
+
+        # 第三步: 运行仿真
+        logger.info(f"\n[第三步] 开始仿真...")
+        logger.info(f"最大步数: {max_steps}")
+        logger.info(f"模式: {'RL控制' if framework.model_loaded else 'Baseline'}")
+
+        step = 0
+        try:
+            while step < max_steps:
+                # 仿真一步
+                traci.simulationStep()
+
+                # 应用控制算法（如果模型加载成功，会使用RL控制）
+                framework.apply_control_algorithm(step)
+
+                # 收集数据
+                framework.collect_step_data(step)
+
+                step += 1
+
+                # 进度报告
+                if step % 100 == 0:
+                    logger.info(f"[步骤 {step}] 活跃: {len(traci.vehicle.getIDList())}, "
+                               f"累计出发: {framework.cumulative_departed}, "
+                               f"累计到达: {framework.cumulative_arrived}")
+
+                # 检查仿真是否结束
+                if traci.simulation.getMinExpectedNumber() <= 0 and step > 100:
+                    logger.info(f"\n仿真自然结束于步骤 {step}")
+                    break
+
+        except Exception as e:
+            logger.error(f"\n仿真过程中发生错误: {e}")
+            import traceback
+            traceback.print_exc()
+
+        finally:
+            traci.close()
+
+        # 第四步: 保存pkl文件
+        logger.info(f"\n[第四步] 保存比赛提交文件...")
         pkl_dir = os.path.join(eval_dir, f"iter_{iteration:04d}")
-        pkl_file = framework.save_to_pickle(output_dir=pkl_dir)
-        logger.info(f"✓ 比赛提交文件已保存: {pkl_file}")
+        result = framework.save_to_pickle(output_dir=pkl_dir)
 
-        # 保存JSON结果（用于训练监控）
+        logger.info("\n" + "=" * 70)
+        logger.info("评估完成!")
+        logger.info("=" * 70)
+        logger.info(f"Pickle文件: {result['pickle_file']}")
+        logger.info(f"文件大小: {result['file_size_mb']:.2f} MB")
+        logger.info(f"总出发车辆: {framework.cumulative_departed}")
+        logger.info(f"总到达车辆: {framework.cumulative_arrived}")
+        logger.info(f"完成率: {framework.cumulative_arrived / max(framework.cumulative_departed, 1):.4f}")
+        logger.info("=" * 70)
+
+        # 保存评估结果JSON
         result_file = os.path.join(eval_dir, f"eval_iter_{iteration:04d}.json")
-
-        result = {
+        result_data = {
             'iteration': iteration,
             'timestamp': datetime.now().isoformat(),
             'model_path': model_path,
-            'metrics': ocr_metrics,
             'statistics': {
                 'total_departed': framework.cumulative_departed,
                 'total_arrived': framework.cumulative_arrived,
                 'completion_rate': framework.cumulative_arrived / max(framework.cumulative_departed, 1)
-            }
+            },
+            'pickle_file': result['pickle_file']
         }
 
         with open(result_file, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
+            json.dump(result_data, f, indent=2, ensure_ascii=False)
 
-        # 输出关键指标
-        logger.info("\n" + "=" * 70)
-        logger.info(f"评估完成 - 迭代 {iteration}")
-        logger.info("=" * 70)
-        logger.info(f"📊 OCR指标:")
-        logger.info(f"  - 全局OCR: {ocr_metrics.get('global_ocr', 0):.4f}")
-        logger.info(f"  - 主路OCR: {ocr_metrics.get('main_road_ocr', 0):.4f}")
-        logger.info(f"  - 匝道OCR: {ocr_metrics.get('ramp_road_ocr', 0):.4f}")
-        logger.info(f"  - 转出OCR: {ocr_metrics.get('diverge_road_ocr', 0):.4f}")
-        logger.info(f"\n📈 统计信息:")
-        logger.info(f"  - 总出发车辆: {framework.cumulative_departed}")
-        logger.info(f"  - 总到达车辆: {framework.cumulative_arrived}")
-        logger.info(f"  - 完成率: {result['statistics']['completion_rate']:.2%}")
-        logger.info(f"\n💾 文件已保存:")
-        logger.info(f"  - 比赛提交: {pkl_file}")
-        logger.info(f"  - 评估结果: {result_file}")
+        logger.info(f"评估结果: {result_file}")
         logger.info("=" * 70)
 
-        # 关闭SUMO
-        framework.close()
-
-        return result
+        return result_data
 
     except Exception as e:
         logger.error(f"评估失败: {e}\n{tb.format_exc()}")

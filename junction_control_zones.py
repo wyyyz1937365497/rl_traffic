@@ -559,18 +559,45 @@ class MultiAgentEnvironmentWithZones:
         return all_vehicles
     
     def _compute_rewards(self) -> Dict[str, float]:
-        """计算奖励"""
-        rewards = {}
+        """计算奖励（修复版：包含正向奖励）"""
+        if not hasattr(self, 'reward_calculator'):
+            from improved_rewards import ImprovedRewardCalculator
+            self.reward_calculator = ImprovedRewardCalculator()
         
-        for junc_id, agent in self.agents.items():
-            # 基于控制的车辆数量和效果计算奖励
-            controlled = agent.get_controlled_vehicles()
-            num_controlled = len(controlled['main']) + len(controlled['ramp']) + len(controlled['diverge'])
+        # 获取环境统计信息
+        env_stats = {
+            'ocr': self._compute_current_ocr(),
+            'step': self.current_step
+        }
+        
+        return self.reward_calculator.compute_rewards(self.agents, env_stats)
+    
+    def _compute_current_ocr(self) -> float:
+        """计算当前OCR"""
+        try:
+            import traci
             
-            # 简单的奖励：控制车辆数量的负数（鼓励减少控制）
-            rewards[junc_id] = -num_controlled * 0.01
-        
-        return rewards
+            arrived = traci.simulation.getArrivedNumber()
+            total = traci.vehicle.getCount()
+            
+            inroute_completion = 0.0
+            for veh_id in traci.vehicle.getIDList():
+                try:
+                    route_idx = traci.vehicle.getRouteIndex(veh_id)
+                    route_len = len(traci.vehicle.getRoute(veh_id))
+                    if route_len > 0:
+                        inroute_completion += route_idx / route_len
+                except:
+                    continue
+            
+            if total == 0:
+                return 0.0
+            
+            ocr = (arrived + inroute_completion) / total
+            return min(ocr, 1.0)
+            
+        except:
+            return 0.0
     
     def _is_done(self) -> bool:
         """检查是否结束"""

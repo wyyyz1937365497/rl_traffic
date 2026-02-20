@@ -162,8 +162,8 @@ class GraphAttentionLayer(nn.Module):
         scores = self.leaky_relu(scores)
         
         # Softmax（按目标节点分组）
-        # 简化处理：使用全局softmax
-        attn = F.softmax(scores, dim=0)
+        # 修复：按目标节点分组计算softmax
+        attn = self._softmax_by_target(scores, dst, num_nodes)
         attn = self.dropout(attn)
         
         # 聚合

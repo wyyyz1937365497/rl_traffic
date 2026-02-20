@@ -9,6 +9,65 @@ import argparse
 import time
 import json
 
+# ===== OCR计算辅助函数 =====
+
+def compute_gap_size(main_vehicles: list, ramp_vehicles: list) -> float:
+    """计算间隙大小"""
+    if not main_vehicles or not ramp_vehicles:
+        return 0.0
+    
+    # 获取主路车辆位置
+    positions = []
+    for veh in main_vehicles:
+        if isinstance(veh, dict):
+            pos = veh.get('lane_position', veh.get('position', 0))
+        else:
+            pos = 0
+        positions.append(pos)
+    
+    if len(positions) < 2:
+        return 10.0
+    
+    # 排序并计算间隙
+    positions.sort(reverse=True)
+    gaps = []
+    for i in range(len(positions) - 1):
+        gap = positions[i] - positions[i + 1]
+        if gap > 5.0:
+            gaps.append(gap)
+    
+    return max(gaps) if gaps else 0.0
+
+def compute_gap_speed_diff(main_vehicles: list, ramp_vehicles: list) -> float:
+    """计算速度差"""
+    if not main_vehicles or not ramp_vehicles:
+        return 0.0
+    
+    # 计算平均速度
+    main_speeds = []
+    for veh in main_vehicles:
+        if isinstance(veh, dict):
+            speed = veh.get('speed', 0)
+        else:
+            speed = 0
+        main_speeds.append(speed)
+    
+    ramp_speeds = []
+    for veh in ramp_vehicles:
+        if isinstance(veh, dict):
+            speed = veh.get('speed', 0)
+        else:
+            speed = 0
+        ramp_speeds.append(speed)
+    
+    import numpy as np
+    avg_main = np.mean(main_speeds) if main_speeds else 0.0
+    avg_ramp = np.mean(ramp_speeds) if ramp_speeds else 0.0
+    
+    return abs(avg_main - avg_ramp)
+
+
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
@@ -161,9 +220,9 @@ class InferenceAgent:
             gap_speed_diff = 0
 
             if main_vehicles and ramp_vehicles:
-                # 简化计算
-                gap_size = 5.0
-                gap_speed_diff = abs(main_speed - ramp_speed)
+                # 修复：精确计算间隙
+                gap_size = compute_gap_size(main_vehicles_info, ramp_vehicles_info)
+                gap_speed_diff = compute_gap_speed_diff(main_vehicles_info, ramp_vehicles_info)
 
             # 计算冲突风险
             conflict_risk = min(len(main_vehicles), len(ramp_vehicles)) / 20.0
