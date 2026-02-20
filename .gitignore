@@ -8,3 +8,4 @@ sumo/logs_parallel/
 tmp/
 logs/
 checkpoints\evaluations/
+*.log

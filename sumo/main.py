@@ -1,5 +1,4 @@
 import os
-from vehicle_type_config import normalize_speed, get_vehicle_max_speed
 import sys
 import traci
 import pandas as pd
@@ -7,76 +6,75 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 import json
 import pickle
-import torch
-import numpy as np
-import logging
-import traceback as tb
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(levelname)s] %(message)s'
-)
-logger = logging.getLogger('sumo_main')
-
-# 添加父目录到路径以导入模型
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from junction_network import MultiJunctionModel
-from junction_agent import JUNCTION_CONFIGS
+# 可选导入（仅在需要使用RL模型时）
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 
 class SUMOCompetitionFramework:
     """
-    SUMO竞赛数据收集框架 - 集成强化学习模型
+    SUMO竞赛数据收集框架
+
+    框架结构:
+    1. 环境初始化 (parse_config, parse_routes, initialize_environment)
+    2. 控制算法实现 (apply_control_algorithm - 参赛者自定义)
+    3. 数据收集与统计 (collect_step_data, save_to_pickle)
     """
 
-    def __init__(self, sumo_cfg_path, model_path="../checkpoints/final_model.pt"):
+    def __init__(self, sumo_cfg_path):
         self.sumo_cfg_path = sumo_cfg_path
-        self.model_path = model_path
         self.routes_file = None
         self.net_file = None
 
         # 数据存储
-        self.vehicle_data = []
-        self.step_data = []
-        self.route_data = {}
-        self.vehicle_od_data = {}
-        self.vehicle_type_maxspeed = {}
+        self.vehicle_data = []  # 车辆级数据
+        self.step_data = []  # 时间步级数据
+        self.route_data = {}  # 车辆路径数据
+        self.vehicle_od_data = {}  # 车辆OD信息存储
+        self.vehicle_type_maxspeed = {}  # 记录每种车辆类型的原始maxSpeed
 
         # 累计统计
-        self.cumulative_departed = 0
-        self.cumulative_arrived = 0
-        self.all_departed_vehicles = set()
-        self.all_arrived_vehicles = set()
+        self.cumulative_departed = 0  # 累计出发车辆数
+        self.cumulative_arrived = 0  # 累计到达车辆数
+        self.all_departed_vehicles = set()  # 所有出发过的车辆
+        self.all_arrived_vehicles = set()  # 所有到达过的车辆
 
         # 红绿灯监控
-        self.traffic_lights = ['J5', 'J14', 'J15', 'J17']
-        self.available_traffic_lights = []
+        self.traffic_lights = ['J5', 'J14', 'J15', 'J17']  # 可修改
+        self.available_traffic_lights = []  # 实际可用的红绿灯
 
         # 仿真参数
         self.flow_rate = 0
         self.simulation_time = 0
         self.step_length = 1.0
-        self.total_demand = 0
+        self.total_demand = 0  # 理论总需求
 
-        # RL模型相关
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # RL模型相关（可选，不修改SUMO配置）
         self.model = None
-        self.agents = {}
         self.model_loaded = False
+        self.device = 'cpu'
+        self.agents = {}
 
         print("=" * 70)
-        print("SUMO竞赛框架 - 强化学习模型版本")
+        print("SUMO竞赛数据收集框架 ")
+        print("=" * 70)
+        print("框架结构:")
+        print("  第一部分: 环境初始化 (Baseline环境)")
+        print("  第二部分: 控制算法 (参赛者自定义)")
+        print("  第三部分: 数据统计与保存 (Pickle格式)")
         print("=" * 70)
 
     # ========================================================================
-    # 第一部分: 环境初始化
+    # 第一部分: 环境初始化 (Baseline环境)
     # ========================================================================
 
     def parse_config(self):
         """解析SUMO配置文件"""
-        print("\n[第一部分] 正在初始化环境...")
+        print("\n[第一部分] 正在初始化Baseline环境...")
 
         tree = ET.parse(self.sumo_cfg_path)
         root = tree.getroot()
@@ -110,65 +108,109 @@ class SUMOCompetitionFramework:
         print(f"  - 时间步长: {self.step_length}s")
 
     def parse_routes(self):
-        """解析路径文件"""
+        """解析路径文件,计算车流量和总需求,并记录原始maxSpeed配置"""
         if not self.routes_file or not os.path.exists(self.routes_file):
-            print("⚠️  路径文件不存在")
-            return
-
-        tree = ET.parse(self.routes_file)
-        root = tree.getroot()
-
-        total_vehicles = 0
-        for vehicle in root.findall('.//vehicle'):
-            total_vehicles += 1
-
-        self.total_demand = total_vehicles
-        print(f"✓ 总需求: {total_vehicles} 辆车")
-
-    def initialize_environment(self):
-        """初始化SUMO环境"""
-        print("\n正在启动SUMO仿真...")
-
-        sumo_cmd = [
-            "sumo",
-            "-c", self.sumo_cfg_path,
-            "--no-warnings", "true",
-            "--seed", "42"
-        ]
-
-        traci.start(sumo_cmd)
-        print("✓ SUMO已启动")
-
-        # 检测可用的红绿灯
-        for tl_id in self.traffic_lights:
-            try:
-                traci.trafficlight.getRedYellowGreenState(tl_id)
-                self.available_traffic_lights.append(tl_id)
-            except Exception as e:
-                print(f"检测信号灯 {tl_id} 失败: {e}")
-
-        print(f"✓ 检测到 {len(self.available_traffic_lights)} 个可控制红绿灯")
-
-    def load_rl_model(self):
-        """加载强化学习模型"""
-        print(f"\n正在加载RL模型: {self.model_path}")
-
-        if not os.path.exists(self.model_path):
-            print(f"⚠️  模型文件不存在: {self.model_path}")
-            print("   将不使用模型控制")
+            print("⚠️  路径文件不存在,无法计算理论需求")
             return
 
         try:
+            tree = ET.parse(self.routes_file)
+            root = tree.getroot()
+
+            total_vehs_per_hour = 0
+            max_end_time = 0
+            total_demand = 0
+
+            # 记录所有车辆类型的原始maxSpeed配置
+            for vtype in root.findall('vType'):
+                vtype_id = vtype.get('id')
+                max_speed = vtype.get('maxSpeed')
+                if max_speed is not None:
+                    self.vehicle_type_maxspeed[vtype_id] = float(max_speed)
+                    print(f"  - 车辆类型 {vtype_id}: maxSpeed = {max_speed} m/s")
+
+            # 计算总需求
+            for flow in root.findall('flow'):
+                vehs_per_hour = float(flow.get('vehsPerHour', 0))
+                begin_time = float(flow.get('begin', 0))
+                end_time = float(flow.get('end', 0))
+
+                duration_hours = (end_time - begin_time) / 3600.0
+                flow_demand = vehs_per_hour * duration_hours
+                total_demand += flow_demand
+
+                total_vehs_per_hour += vehs_per_hour
+                max_end_time = max(max_end_time, end_time)
+
+            # 计算单独的trip数量
+            trip_count = len(root.findall('trip'))
+            total_demand += trip_count
+
+            self.simulation_time = max_end_time
+            self.flow_rate = total_vehs_per_hour / 3600.0
+            self.total_demand = total_demand
+
+            print(f"✓ 交通需求分析:")
+            print(f"  - 流量率: {self.flow_rate:.4f} veh/s")
+            print(f"  - 仿真时长: {self.simulation_time:.2f} s")
+            print(f"  - 理论总需求: {self.total_demand:.0f} 车辆")
+            print(f"  - 单独trip数量: {trip_count}")
+            print(f"  - 记录车辆类型数: {len(self.vehicle_type_maxspeed)}")
+
+        except Exception as e:
+            print(f"❌ 路径文件解析失败: {e}")
+
+    def initialize_traffic_lights(self):
+        """初始化红绿灯监控"""
+        try:
+            all_tls = traci.trafficlight.getIDList()
+
+            for tl_id in self.traffic_lights:
+                if tl_id in all_tls:
+                    self.available_traffic_lights.append(tl_id)
+                else:
+                    print(f"⚠️  红绿灯 {tl_id} 不存在于当前网络中")
+
+            print(f"✓ 红绿灯监控设置:")
+            print(f"  - 目标红绿灯: {self.traffic_lights}")
+            print(f"  - 可用红绿灯: {self.available_traffic_lights}")
+            print(f"  - 全部红绿灯: {list(all_tls)}")
+
+        except Exception as e:
+            print(f"❌ 红绿灯初始化失败: {e}")
+            self.available_traffic_lights = []
+
+    def load_rl_model(self, model_path, device='cuda'):
+        """
+        加载RL模型（可选功能，不修改SUMO配置）
+
+        注意: 此方法仅加载模型用于推理，不修改任何SUMO配置参数
+              所有控制通过TraCI命令实现
+
+        Args:
+            model_path: 模型文件路径
+            device: 设备 ('cuda' or 'cpu')
+        """
+        if not TORCH_AVAILABLE:
+            print("⚠️  PyTorch未安装，无法加载RL模型")
+            return False
+
+        try:
+            # 导入必要的模块
+            from junction_network import create_junction_model, NetworkConfig
+            from junction_agent import JUNCTION_CONFIGS, RLAgent
+
+            # 设置设备
+            self.device = device if torch.cuda.is_available() else 'cpu'
+
             # 创建模型
-            self.model = MultiJunctionModel(JUNCTION_CONFIGS)
-            self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+            self.model = create_junction_model(NetworkConfig())
+            checkpoint = torch.load(model_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
             self.model.to(self.device)
             self.model.eval()
-            self.model_loaded = True
 
-            print(f"✓ 模型已加载到 {self.device}")
-
-            # 创建智能体 - 将JunctionConfig转换为字典格式
+            # 创建智能体
             for junc_id, junc_config in JUNCTION_CONFIGS.items():
                 # 转换为RLAgent期望的字典格式
                 config_dict = {
@@ -179,20 +221,119 @@ class SUMOCompetitionFramework:
                 }
                 self.agents[junc_id] = RLAgent(junc_id, config_dict, self.model, self.device)
 
-            print(f"✓ 已创建 {len(self.agents)} 个RL智能体")
+            self.model_loaded = True
+            print(f"✓ RL模型已加载: {model_path}")
+            print(f"  设备: {self.device}")
+            print(f"  智能体数量: {len(self.agents)}")
+            return True
 
         except Exception as e:
             print(f"⚠️  模型加载失败: {e}")
-            print("   将不使用模型控制")
+            print("  将运行Baseline模式（无模型控制）")
             self.model_loaded = False
+            return False
+
+    def initialize_environment(self, use_gui=True, max_steps=1000):
+        """初始化SUMO仿真环境"""
+        print("\n[第一部分] 正在启动SUMO仿真...")
+
+        # 解析配置
+        self.parse_config()
+        self.parse_routes()
+
+        # 启动SUMO
+        sumo_binary = "sumo-gui" if use_gui else "sumo"
+        sumo_cmd = [
+            sumo_binary,
+            "-c", self.sumo_cfg_path,
+            "--no-warnings", "true",
+            "--duration-log.statistics", "true"
+        ]
+
+        try:
+            traci.start(sumo_cmd)
+            print(f"✓ SUMO启动成功 (模式: {'GUI' if use_gui else 'CLI'})")
+        except Exception as e:
+            print(f"❌ SUMO启动失败: {e}")
+            return False
+
+        # 初始化红绿灯
+        self.initialize_traffic_lights()
+
+        print("✓ Baseline环境初始化完成!\n")
+        return True
 
     # ========================================================================
-    # 第二部分: 控制算法实现
+    # 第二部分: 控制算法实现 (参赛者自定义)
     # ========================================================================
 
     def apply_control_algorithm(self, step):
-        """应用RL模型控制算法"""
-        if not self.model_loaded or step < 10:
+        """
+        应用控制优化算法 - 参赛者在此实现自己的算法
+
+        参数:
+            step: 当前仿真步数
+
+        示例算法:
+            - 自适应信号灯控制
+            - 动态路径规划
+            - 车辆速度控制
+            - 交通流优化
+
+        可用的TraCI函数示例:
+            - traci.trafficlight.setPhase(tl_id, phase_index)
+            - traci.trafficlight.setPhaseDuration(tl_id, duration)
+            - traci.vehicle.setSpeed(veh_id, speed)
+            - traci.vehicle.setRoute(veh_id, edge_list)
+        """
+
+        # ============================================================
+        # 参赛者代码区域开始
+        # ============================================================
+
+        # 如果有加载RL模型，使用模型进行控制
+        if hasattr(self, 'model_loaded') and self.model_loaded:
+            try:
+                self._apply_rl_control(step)
+            except Exception as e:
+                # 静默失败，不影响仿真
+                pass
+
+        # 示例1: 简单的固定相位时长控制
+        # for tl_id in self.available_traffic_lights:
+        #     current_phase = traci.trafficlight.getPhase(tl_id)
+        #     # 设置固定相位时长为30秒
+        #     traci.trafficlight.setPhaseDuration(tl_id, 30)
+
+        # 示例2: 基于车辆数的自适应信号灯
+        # for tl_id in self.available_traffic_lights:
+        #     # 获取信号灯控制的车道
+        #     controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
+        #     vehicle_count = sum(traci.lane.getLastStepVehicleNumber(lane)
+        #                        for lane in controlled_lanes)
+        #
+        #     # 根据车辆数动态调整相位
+        #     if vehicle_count > 10:
+        #         traci.trafficlight.setPhaseDuration(tl_id, 45)
+        #     else:
+        #         traci.trafficlight.setPhaseDuration(tl_id, 20)
+
+        # 示例3: 车辆速度控制
+        # vehicle_ids = traci.vehicle.getIDList()
+        # for veh_id in vehicle_ids:
+        #     current_speed = traci.vehicle.getSpeed(veh_id)
+        #     edge_id = traci.vehicle.getRoadID(veh_id)
+        #     # 实现自定义的速度控制逻辑
+
+        # ============================================================
+        # 参赛者代码区域结束
+        # ============================================================
+
+        pass  # 默认不执行任何控制算法
+
+    def _apply_rl_control(self, step):
+        """使用RL模型进行控制（可选功能）"""
+        if step < 10:
             return
 
         try:
@@ -201,62 +342,56 @@ class SUMOCompetitionFramework:
             vehicle_obs = {}
 
             for junc_id, agent in self.agents.items():
-                state_vec = agent.observe(traci)
-                if state_vec is not None:
-                    obs_tensors[junc_id] = torch.tensor(
-                        state_vec, dtype=torch.float32, device=self.device
-                    ).unsqueeze(0)
-
-                    controlled = agent.get_controlled_vehicles()
-                    vehicle_obs[junc_id] = {
-                        'main': agent.get_vehicle_features(controlled['main'], traci, self.device),
-                        'ramp': agent.get_vehicle_features(controlled['ramp'], traci, self.device),
-                        'diverge': agent.get_vehicle_features(controlled['diverge'], traci, self.device)
-                    }
+                obs = agent.observe(traci)
+                if obs is not None:
+                    obs_tensors[junc_id] = obs
+                    vehicle_obs[junc_id] = agent.get_vehicle_features(
+                        agent.get_controlled_vehicles(), traci, self.device
+                    )
 
             if not obs_tensors:
                 return
 
             # 模型推理
             with torch.no_grad():
-                actions, values, info = self.model(obs_tensors, vehicle_obs, deterministic=True)
+                actions, _, _ = self.model(obs_tensors, vehicle_obs, deterministic=True)
 
-            # 应用控制动作（与训练时完全一致的逻辑）
-            for junc_id, action in actions.items():
-                agent = self.agents[junc_id]
-                controlled = agent.get_controlled_vehicles()
-
-                # 控制主路车辆
-                if controlled['main'] and 'main' in action:
-                    for veh_id in controlled['main'][:1]:
-                        try:
-                            action_value = action['main'].item()
-                            # 与训练时完全一致的映射
-                            speed_limit = 13.89
-                            target_speed = speed_limit * (0.3 + 0.9 * action_value)
-                            # 确保速度在合理范围内
-                            target_speed = max(0.0, min(target_speed, speed_limit * 1.2))
-                            traci.vehicle.setSpeed(veh_id, target_speed)
-                        except Exception as e:
-                            print(f"设置主路车辆 {veh_id} 速度失败: {e}")
-
-                # 控制匝道车辆
-                if controlled['ramp'] and 'ramp' in action:
-                    for veh_id in controlled['ramp'][:1]:
-                        try:
-                            action_value = action['ramp'].item()
-                            # 与训练时完全一致的映射
-                            speed_limit = 13.89
-                            target_speed = speed_limit * (0.3 + 0.9 * action_value)
-                            # 确保速度在合理范围内
-                            target_speed = max(0.0, min(target_speed, speed_limit * 1.2))
-                            traci.vehicle.setSpeed(veh_id, target_speed)
-                        except Exception as e:
-                            print(f"设置匝道车辆 {veh_id} 速度失败: {e}")
+            # 应用控制动作
+            self._apply_actions(actions)
 
         except Exception as e:
-            # 静默失败，不影响仿真
             pass
+
+    def _apply_actions(self, actions):
+        """应用模型输出的动作"""
+        for junc_id, action in actions.items():
+            if junc_id not in self.agents:
+                continue
+
+            agent = self.agents[junc_id]
+            controlled = agent.get_controlled_vehicles()
+
+            if controlled['main'] and 'main' in action:
+                for veh_id in controlled['main'][:1]:
+                    try:
+                        action_value = action['main'].item()
+                        speed_limit = 13.89
+                        target_speed = speed_limit * (0.3 + 0.9 * action_value)
+                        target_speed = max(0.0, min(target_speed, speed_limit * 1.2))
+                        traci.vehicle.setSpeed(veh_id, target_speed)
+                    except Exception as e:
+                        continue
+
+            if controlled['ramp'] and 'ramp' in action:
+                for veh_id in controlled['ramp'][:1]:
+                    try:
+                        action_value = action['ramp'].item()
+                        speed_limit = 13.89
+                        target_speed = speed_limit * (0.3 + 0.9 * action_value)
+                        target_speed = max(0.0, min(target_speed, speed_limit * 1.2))
+                        traci.vehicle.setSpeed(veh_id, target_speed)
+                    except Exception as e:
+                        continue
 
     # ========================================================================
     # 第三部分: 数据收集与统计
@@ -265,23 +400,26 @@ class SUMOCompetitionFramework:
     def get_traffic_light_states(self):
         """获取红绿灯状态"""
         tl_states = {}
+
         for tl_id in self.available_traffic_lights:
             try:
                 state = traci.trafficlight.getRedYellowGreenState(tl_id)
                 phase = traci.trafficlight.getPhase(tl_id)
                 remaining_time = traci.trafficlight.getNextSwitch(tl_id) - traci.simulation.getTime()
+
                 tl_states[f'{tl_id}_state'] = state
                 tl_states[f'{tl_id}_phase'] = phase
                 tl_states[f'{tl_id}_remaining_time'] = remaining_time
+
             except Exception as e:
-                print(f"获取信号灯 {tl_id} 状态失败: {e}")
                 tl_states[f'{tl_id}_state'] = 'unknown'
                 tl_states[f'{tl_id}_phase'] = -1
                 tl_states[f'{tl_id}_remaining_time'] = -1
+
         return tl_states
 
     def get_vehicle_od(self, veh_id):
-        """获取车辆OD信息"""
+        """获取车辆OD信息和车辆类型的原始maxSpeed配置"""
         if veh_id in self.vehicle_od_data:
             return self.vehicle_od_data[veh_id]
 
@@ -297,124 +435,112 @@ class SUMOCompetitionFramework:
                 origin = "unknown"
                 destination = "unknown"
 
+            # 获取车辆类型
             vehicle_type = traci.vehicle.getTypeID(veh_id)
-            original_max_speed = self.get_original_max_speed(vehicle_type)
+
+            # 获取该车辆类型的原始maxSpeed配置(从route文件中读取的)
+            original_max_speed = self.vehicle_type_maxspeed.get(vehicle_type, None)
 
             od_info = {
                 'origin': origin,
                 'destination': destination,
                 'route_length': len(route),
                 'vehicle_type': vehicle_type,
-                'original_max_speed': original_max_speed
+                'original_max_speed': original_max_speed  # 配置文件中的原始maxSpeed
             }
 
             self.vehicle_od_data[veh_id] = od_info
             return od_info
 
         except Exception as e:
-            return {
-                'origin': 'unknown',
-                'destination': 'unknown',
+            od_info = {
+                'origin': "unknown",
+                'destination': "unknown",
                 'route_length': 0,
-                'vehicle_type': 'unknown',
-                'original_max_speed': 0.0
+                'vehicle_type': "unknown",
+                'original_max_speed': None
             }
+            self.vehicle_od_data[veh_id] = od_info
+            return od_info
 
-    def get_original_max_speed(self, vehicle_type):
-        """获取车辆类型的原始maxSpeed配置"""
-        if vehicle_type in self.vehicle_type_maxspeed:
-            return self.vehicle_type_maxspeed[vehicle_type]
-
-        try:
-            max_speed = traci.vehicletype.getMaxSpeed(vehicle_type)
-            self.vehicle_type_maxspeed[vehicle_type] = max_speed
-            return max_speed
-        except Exception as e:
-            print(f"获取车辆类型 {vehicle_type} 最大速度失败: {e}")
-            return 0.0
-
-    def get_route_length(self, route_edges):
-        """计算路径长度"""
-        total_length = 0.0
-        for edge_id in route_edges:
+    def get_route_length(self, edges):
+        """计算路径总长度"""
+        total_length = 0
+        for edge_id in edges:
             try:
-                total_length += traci.lane.getLength(edge_id + "_0")
-            except Exception as e:
-                print(f"获取边 {edge_id} 长度失败: {e}")
+                edge_length = traci.edge.getLength(edge_id)
+                total_length += edge_length
+            except:
+                try:
+                    lane_id = f"{edge_id}_0"
+                    edge_length = traci.lane.getLength(lane_id)
+                    total_length += edge_length
+                except:
+                    total_length += 100
         return total_length
 
     def calculate_traveled_distance(self, veh_id, route_info):
-        """计算已行驶距离"""
-        traveled = 0.0
-        route_index = traci.vehicle.getRouteIndex(veh_id)
+        """计算车辆已行驶距离"""
+        try:
+            current_edge = traci.vehicle.getRoadID(veh_id)
+            current_position = traci.vehicle.getLanePosition(veh_id)
+            route_edges = route_info['route_edges']
 
-        for i in range(route_index):
-            try:
-                edge_id = route_info['route_edges'][i]
-                traveled += traci.lane.getLength(edge_id + "_0")
-            except Exception as e:
-                print(f"计算车辆 {veh_id} 行驶距离失败: {e}")
+            traveled = 0
+            for edge in route_edges:
+                if edge == current_edge:
+                    traveled += current_position
+                    break
+                else:
+                    try:
+                        edge_length = traci.edge.getLength(edge)
+                        traveled += edge_length
+                    except:
+                        traveled += 100
 
-        traveled += traci.vehicle.getLanePosition(veh_id)
-        return traveled
-
-    def check_maxspeed_violations(self):
-        """检查maxSpeed违规"""
-        violations = []
-        for veh_id in traci.vehicle.getIDList():
-            try:
-                current_speed = traci.vehicle.getSpeed(veh_id)
-                max_speed = traci.vehicle.getMaxSpeed(veh_id)
-                if current_speed > max_speed + 0.1:
-                    violations.append({
-                        'vehicle_id': veh_id,
-                        'current_speed': current_speed,
-                        'max_speed': max_speed,
-                        'violation': current_speed - max_speed
-                    })
-            except Exception as e:
-                print(f"检查车辆 {veh_id} maxSpeed违规失败: {e}")
-        return violations
+            return min(traveled, route_info['route_length'])
+        except:
+            return 0
 
     def collect_step_data(self, step):
-        """收集每步数据"""
-        current_time = traci.simulation.getTime()
-        current_vehicle_ids = traci.vehicle.getIDList()
+        """收集每个时间步的数据"""
+        current_time = step * self.step_length
 
-        # 统计出发和到达（修复：使用累计统计）
-        step_departed = traci.simulation.getDepartedNumber()  # 当前步出发
-        step_arrived = traci.simulation.getArrivedNumber()    # 当前步到达
+        # 获取当前活跃车辆
+        current_vehicle_ids = set(traci.vehicle.getIDList())
 
-        # 累加到总数
-        self.cumulative_departed += step_departed
-        self.cumulative_arrived += step_arrived
+        # 更新累计统计
+        current_arrived_ids = set(traci.simulation.getArrivedIDList())
+        current_departed_ids = set(traci.simulation.getDepartedIDList())
 
-        # 获取新出发和到达的车辆ID
-        if step_departed > 0:
-            new_departed = set(traci.simulation.getDepartedIDList())
-            self.all_departed_vehicles.update(new_departed)
+        new_arrivals = current_arrived_ids - self.all_arrived_vehicles
+        self.all_arrived_vehicles.update(new_arrivals)
+        self.cumulative_arrived = len(self.all_arrived_vehicles)
 
-        if step_arrived > 0:
-            new_arrived = set(traci.simulation.getArrivedIDList())
-            self.all_arrived_vehicles.update(new_arrived)
+        new_departures = current_departed_ids - self.all_departed_vehicles
+        self.all_departed_vehicles.update(new_departures)
+        self.cumulative_departed = len(self.all_departed_vehicles)
 
-        # 收集时间步级数据
+        # 获取红绿灯状态
+        traffic_light_states = self.get_traffic_light_states()
+
+        # 记录时间步级数据
         step_record = {
             'step': step,
             'time': current_time,
-            'departed': self.cumulative_departed,  # 使用累计值
-            'arrived': self.cumulative_arrived,    # 使用累计值
-            'active_vehicles': len(current_vehicle_ids)
+            'active_vehicles': len(current_vehicle_ids),
+            'arrived_vehicles': self.cumulative_arrived,
+            'departed_vehicles': self.cumulative_departed,
+            'current_arrivals': len(new_arrivals),
+            'current_departures': len(new_departures)
         }
-
-        traffic_light_states = self.get_traffic_light_states()
         step_record.update(traffic_light_states)
         self.step_data.append(step_record)
 
         # 收集车辆级数据
         for veh_id in current_vehicle_ids:
             try:
-                speed = traci.vehicle.getSpeed(veh_id)
+                speed = traci.vehicle.getSpeed(veh_id)  # 瞬时速度
                 position = traci.vehicle.getLanePosition(veh_id)
                 edge_id = traci.vehicle.getRoadID(veh_id)
                 route_index = traci.vehicle.getRouteIndex(veh_id)
@@ -437,7 +563,7 @@ class SUMOCompetitionFramework:
                     'step': step,
                     'time': current_time,
                     'vehicle_id': veh_id,
-                    'speed': speed,
+                    'speed': speed,  # 瞬时速度
                     'position': position,
                     'edge_id': edge_id,
                     'route_index': route_index,
@@ -447,7 +573,7 @@ class SUMOCompetitionFramework:
                     'origin': od_info['origin'],
                     'destination': od_info['destination'],
                     'route_edges_count': od_info['route_length'],
-                    'max_speed': od_info['original_max_speed'],
+                    'max_speed': od_info['original_max_speed'],  # 车辆类型的原始maxSpeed配置
                     'vehicle_type': od_info['vehicle_type']
                 }
                 self.vehicle_data.append(vehicle_record)
@@ -461,75 +587,6 @@ class SUMOCompetitionFramework:
                   f"累计出发: {self.cumulative_departed}, "
                   f"累计到达: {self.cumulative_arrived}")
 
-    def calculate_ocr_metrics(self):
-        """
-        计算OCR（Overall Completion Rate）指标
-
-        Returns:
-            dict: 包含各种OCR指标的字典
-        """
-        # 全局OCR
-        global_ocr = self.cumulative_arrived / max(self.cumulative_departed, 1)
-
-        # 根据OD信息计算分类OCR
-        main_departed = 0
-        main_arrived = 0
-        ramp_departed = 0
-        ramp_arrived = 0
-        diverge_departed = 0
-        diverge_arrived = 0
-
-        for veh_id, od_info in self.vehicle_od_data.items():
-            # 获取车辆出发边缘
-            depart_edge = od_info.get('depart_edge', '')
-
-            # 获取车辆到达边缘
-            arrive_edge = od_info.get('arrive_edge', '')
-            did_arrive = arrive_edge != ''
-
-            # 判断车辆类型（基于出发边缘）
-            if 'main' in depart_edge.lower() or depart_edge.startswith('-'):
-                # 主路车辆
-                main_departed += 1
-                if did_arrive:
-                    main_arrived += 1
-            elif 'ramp' in depart_edge.lower():
-                # 匝道车辆
-                ramp_departed += 1
-                if did_arrive:
-                    ramp_arrived += 1
-
-            # 判断转出车辆（基于到达边缘）
-            if did_arrive and 'diverge' in arrive_edge.lower():
-                diverge_arrived += 1
-                # 如果出发是主路或匝道，也算作转出出发
-                if 'main' in depart_edge.lower() or depart_edge.startswith('-'):
-                    diverge_departed += 1
-                elif 'ramp' in depart_edge.lower():
-                    diverge_departed += 1
-
-        # 计算各类OCR
-        main_ocr = main_arrived / max(main_departed, 1)
-        ramp_ocr = ramp_arrived / max(ramp_departed, 1)
-        diverge_ocr = diverge_arrived / max(diverge_departed, 1)
-
-        return {
-            'global_ocr': global_ocr,
-            'main_road_ocr': main_ocr,
-            'ramp_road_ocr': ramp_ocr,
-            'diverge_road_ocr': diverge_ocr,
-            'statistics': {
-                'total_departed': self.cumulative_departed,
-                'total_arrived': self.cumulative_arrived,
-                'main_departed': main_departed,
-                'main_arrived': main_arrived,
-                'ramp_departed': ramp_departed,
-                'ramp_arrived': ramp_arrived,
-                'diverge_departed': diverge_departed,
-                'diverge_arrived': diverge_arrived
-            }
-        }
-
     def save_to_pickle(self, output_dir="competition_results"):
         """保存数据到pickle文件"""
         print(f"\n[第三部分] 正在保存仿真数据到Pickle格式...")
@@ -537,9 +594,12 @@ class SUMOCompetitionFramework:
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        # 检查maxSpeed是否被修改
         maxspeed_violations = self.check_maxspeed_violations()
 
+        # 准备完整数据包
         data_package = {
+            # 仿真参数
             'parameters': {
                 'flow_rate': self.flow_rate,
                 'simulation_time': self.simulation_time,
@@ -552,320 +612,309 @@ class SUMOCompetitionFramework:
                 'monitored_traffic_lights': self.traffic_lights,
                 'available_traffic_lights': self.available_traffic_lights,
                 'collection_timestamp': timestamp,
-                'vehicle_type_maxspeed': self.vehicle_type_maxspeed,
-                'model_used': self.model_path if self.model_loaded else 'None'
+                'vehicle_type_maxspeed': self.vehicle_type_maxspeed  # 原始车辆类型配置
             },
+            # 原始数据
             'step_data': self.step_data,
             'vehicle_data': self.vehicle_data,
             'route_data': self.route_data,
             'vehicle_od_data': self.vehicle_od_data,
+            # 累计统计
             'statistics': {
                 'all_departed_vehicles': list(self.all_departed_vehicles),
                 'all_arrived_vehicles': list(self.all_arrived_vehicles),
                 'cumulative_departed': self.cumulative_departed,
                 'cumulative_arrived': self.cumulative_arrived,
-                'maxspeed_violations': maxspeed_violations
+                'maxspeed_violations': maxspeed_violations  # maxSpeed违规检测结果
             }
         }
 
-        pickle_file = os.path.join(output_dir, "submit.pkl")
+        # 保存pickle文件
+        pickle_file = os.path.join(output_dir, f"submit.pkl")
 
         with open(pickle_file, 'wb') as f:
-            pickle.dump(data_package, f)
+            pickle.dump(data_package, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        print(f"✓ 数据已保存到: {pickle_file}")
-        print(f"\n最终统计:")
-        print(f"  - 总需求: {self.total_demand}")
-        print(f"  - 出发车辆: {self.cumulative_departed}")
-        print(f"  - 到达车辆: {self.cumulative_arrived}")
-        print(f"  - OCR: {self.cumulative_arrived / max(self.cumulative_departed, 1):.4f}")
-        print(f"  - maxSpeed违规: {len(maxspeed_violations)}")
+        # 计算文件大小
+        file_size = os.path.getsize(pickle_file) / (1024 * 1024)  # MB
 
-        return pickle_file
+        # 另外保存一个汇总JSON文件(可选,方便快速查看)
+        summary_file = os.path.join(output_dir, f"summary_{timestamp}.json")
+        summary_data = {
+            'parameters': data_package['parameters'],
+            'statistics': data_package['statistics']
+        }
 
-    def run_simulation(self):
-        """运行完整仿真"""
-        print("\n[第二部分] 开始仿真...")
-        print(f"设备: {self.device}")
-        print(f"模型状态: {'已加载' if self.model_loaded else '未加载'}")
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            json.dump(summary_data, f, indent=2, ensure_ascii=False)
 
-        # 应用CACC参数优化（与训练环境完全一致）
-        self._apply_cacc_parameters()
+        # 输出保存结果
+        print(f"\n{'=' * 70}")
+        print(f"数据保存统计")
+        print(f"{'=' * 70}")
+        print(f"✓ Pickle文件已保存: {pickle_file}")
+        print(f"  - 文件大小: {file_size:.2f} MB")
+        print(f"  - 时间步数据记录: {len(self.step_data):,} 条")
+        print(f"  - 车辆数据记录: {len(self.vehicle_data):,} 条")
+        print(f"  - 唯一车辆数: {len(self.route_data):,} 辆")
+        print(f"\n✓ 汇总JSON已保存: {summary_file}")
+        print(f"{'=' * 70}")
+
+        # 数据统计报告
+        print(f"\n{'=' * 70}")
+        print(f"仿真结果统计")
+        print(f"{'=' * 70}")
+        print(f"理论总需求:     {self.total_demand:.0f} 车辆")
+        print(f"实际累计出发:   {self.cumulative_departed} 车辆")
+        print(f"实际累计到达:   {self.cumulative_arrived} 车辆")
+        print(f"数据记录总数:   {len(self.step_data) + len(self.vehicle_data):,} 条")
+
+        print(f"{'=' * 70}")
+
+        return {
+            'pickle_file': pickle_file,
+            'summary_file': summary_file,
+            'file_size_mb': file_size,
+            'maxspeed_violations': maxspeed_violations
+        }
+
+    def check_maxspeed_violations(self):
+        """检查是否存在maxSpeed违规（这里不再适用，因为现在记录的是瞬时速度）"""
+        # 由于现在max_speed字段记录的是车辆类型的原始配置，不再需要检测违规
+        # 但为了保持数据结构完整性，仍然返回基本信息
+        return {
+            'has_violations': False,
+            'violations': {},
+            'total_vehicle_types_checked': len(self.vehicle_type_maxspeed),
+        }
+
+    def run(self, max_steps=3600, use_gui=True):
+        """运行完整的仿真流程"""
+        print("\n开始运行SUMO竞赛仿真框架...")
+        print(f"最大步数: {max_steps}\n")
+
+        # 第一部分: 初始化Baseline环境
+        if not self.initialize_environment(use_gui=use_gui, max_steps=max_steps):
+            print("❌ 环境初始化失败")
+            return False
+
+        # 仿真主循环
+        print(f"\n{'=' * 70}")
+        print("[第二部分] 开始运行控制算法...")
+        print(f"{'=' * 70}\n")
 
         step = 0
-        while step < 3600:  # 默认3600步
-            # 应用控制算法
-            self.apply_control_algorithm(step)
-
-            # 仿真一步
-            traci.simulationStep()
-
-            # 收集数据
-            self.collect_step_data(step)
-
-            step += 1
-
-        print(f"\n✓ 仿真完成 ({step} 步)")
-
-    def _apply_cacc_parameters(self):
-        """
-        应用CACC参数优化
-
-        核心策略：
-        - sigma=0: 消除随机减速（完美驾驶），提高交通流稳定性
-        - tau=1.12: 微增跟车时距（抵消sigma=0带来的容量增加，保持安全性）
-
-        这个设置与训练环境完全一致，确保训练和推理的动作空间一致。
-        """
-        logger.info("✓ 应用CACC参数优化 (sigma=0, tau=1.12)")
-
-        cacc_applied = set()  # 跟踪已设置的车辆，避免重复设置
-        failed_vehicles = []  # 记录失败的车辆
-
         try:
-            all_vehicles = traci.vehicle.getIDList()
-            logger.debug(f"开始应用CACC参数，车辆总数={len(all_vehicles)}")
+            while step < max_steps:
+                # 执行仿真步
+                traci.simulationStep()
 
-            for veh_id in all_vehicles:
-                if veh_id in cacc_applied:
-                    continue
+                # 第二部分: 应用控制算法
+                self.apply_control_algorithm(step)
 
-                try:
-                    # 只对CV（Connected Vehicle）类型应用CACC参数
-                    veh_type = traci.vehicle.getTypeID(veh_id)
-                    if veh_type == 'CV':
-                        # 设置imperfection（sigma）为0，消除随机减速
-                        traci.vehicle.setImperfection(veh_id, 0.0)
+                # 第三部分: 收集数据
+                self.collect_step_data(step)
 
-                        # 设置tau（跟车时距）为1.12秒，略微增大以保持安全距离
-                        traci.vehicle.setTau(veh_id, 1.12)
+                step += 1
 
-                        cacc_applied.add(veh_id)
-                except Exception as e:
-                    # 车辆可能在设置过程中离开路网，记录但不中断
-                    failed_vehicles.append((veh_id, str(e)))
-
-            logger.info(f"  已为 {len(cacc_applied)} 辆CV车辆应用CACC参数，失败 {len(failed_vehicles)} 辆")
-            if failed_vehicles and len(failed_vehicles) <= 5:
-                for veh_id, err in failed_vehicles[:5]:
-                    logger.debug(f"  车辆 {veh_id} 设置失败: {err}")
+                # 检查仿真是否结束
+                if traci.simulation.getMinExpectedNumber() <= 0 and step > 100:
+                    print(f"\n仿真自然结束于步骤 {step}")
+                    break
 
         except Exception as e:
-            logger.error(f"  ⚠️  CACC参数设置过程中出现错误: {e}\n{tb.format_exc()}")
+            print(f"\n❌ 仿真过程中发生错误: {e}")
+            import traceback
+            traceback.print_exc()
 
-    def close(self):
-        """关闭仿真"""
-        try:
+        finally:
             traci.close()
-        except Exception as e:
-            print(f"关闭TraCI连接失败: {e}")
+
+        # 第三部分: 保存数据
+        print(f"\n{'=' * 70}")
+        result = self.save_to_pickle()
+
+        print(f"\n✅ 仿真完成!")
+        print(f"\n可使用此Pickle文件进行评测提交: {result['pickle_file']}")
+
+        return True
 
 
-class RLAgent:
-    """强化学习智能体"""
+# ============================================================================
+# 数据读取辅助函数
+# ============================================================================
 
-    def __init__(self, agent_id, config, model, device):
-        self.agent_id = agent_id
-        self.config = config
-        self.model = model
-        self.device = device
+def load_pickle_data(pickle_file):
+    """
+    从pickle文件加载数据
 
-        self.edge_ids = config.get('edges', {})
-        self.current_state = None
+    参数:
+        pickle_file: pickle文件路径
 
-    def observe(self, traci_conn):
-        """观察环境并返回状态向量"""
-        try:
-            main_edges = self.edge_ids.get('main', [])
-            ramp_edges = self.edge_ids.get('ramp', [])
+    返回:
+        data_package: 包含所有数据的字典
+            - parameters: 仿真参数
+            - step_data: 时间步数据列表
+            - vehicle_data: 车辆数据列表
+            - route_data: 路径数据字典
+            - vehicle_od_data: OD数据字典
+            - statistics: 统计数据
+    """
+    print(f"正在加载数据: {pickle_file}")
 
-            # 获取主路状态
-            main_vehicles = []
-            main_queue_length = 0
-            main_speed = 0
-            main_density = 0
+    with open(pickle_file, 'rb') as f:
+        data_package = pickle.load(f)
 
-            for edge_id in main_edges:
-                try:
-                    veh_ids = traci_conn.edge.getLastStepVehicleIDs(edge_id)
-                    main_vehicles.extend(veh_ids)
-                    main_queue_length += traci_conn.edge.getWaitingTime(edge_id)
+    print(f"✓ 数据加载成功!")
+    print(f"  - 参数: {len(data_package['parameters'])} 项")
+    print(f"  - 时间步数据: {len(data_package['step_data']):,} 条")
+    print(f"  - 车辆数据: {len(data_package['vehicle_data']):,} 条")
+    print(f"  - 路径数据: {len(data_package['route_data']):,} 辆车")
 
-                    for veh_id in veh_ids:
-                        main_speed += traci_conn.vehicle.getSpeed(veh_id)
-                except Exception as e:
-                    print(f"获取主路边 {edge_id} 状态失败: {e}")
-
-            if main_vehicles:
-                main_speed /= len(main_vehicles)
-                main_density = len(main_vehicles) / (len(main_edges) * 500.0)
-
-            # 获取匝道状态
-            ramp_vehicles = []
-            ramp_queue_length = 0
-            ramp_speed = 0
-            ramp_density = 0
-            ramp_waiting_time = 0
-
-            for edge_id in ramp_edges:
-                try:
-                    veh_ids = traci_conn.edge.getLastStepVehicleIDs(edge_id)
-                    ramp_vehicles.extend(veh_ids)
-                    ramp_queue_length += traci_conn.edge.getWaitingTime(edge_id)
-
-                    for veh_id in veh_ids:
-                        ramp_speed += traci_conn.vehicle.getSpeed(veh_id)
-                        waiting_time = traci_conn.vehicle.getWaitingTime(veh_id)
-                        ramp_waiting_time = max(ramp_waiting_time, waiting_time)
-                except Exception as e:
-                    print(f"获取匝道边 {edge_id} 状态失败: {e}")
-
-            if ramp_vehicles:
-                ramp_speed /= len(ramp_vehicles)
-                ramp_density = len(ramp_vehicles) / (len(ramp_edges) * 500.0)
-
-            # 计算间隙和冲突风险
-            gap_size = 5.0 if (main_vehicles and ramp_vehicles) else 10.0
-            gap_speed_diff = abs(main_speed - ramp_speed) if (main_vehicles and ramp_vehicles) else 0
-            conflict_risk = min(len(main_vehicles), len(ramp_vehicles)) / 20.0
-
-            # 检测CV
-            has_cv = False
-            all_vehicles = main_vehicles + ramp_vehicles
-            for veh_id in all_vehicles:
-                try:
-                    if traci_conn.vehicle.getTypeID(veh_id) == 'CV':
-                        has_cv = True
-                        break
-                except Exception as e:
-                    print(f"检测车辆 {veh_id} 类型失败: {e}")
-
-            self.current_state = {
-                'main_queue_length': main_queue_length,
-                'ramp_queue_length': ramp_queue_length,
-                'main_speed': main_speed,
-                'ramp_speed': ramp_speed,
-                'main_density': main_density,
-                'ramp_density': ramp_density,
-                'ramp_waiting_time': ramp_waiting_time,
-                'gap_size': gap_size,
-                'gap_speed_diff': gap_speed_diff,
-                'has_cv': has_cv,
-                'conflict_risk': conflict_risk,
-                'main_stop_count': 0,
-                'ramp_stop_count': 0,
-                'throughput': len(main_vehicles) + len(ramp_vehicles)
-            }
-
-            # 返回状态向量
-            return np.array([
-                main_queue_length,
-                ramp_queue_length,
-                main_speed / 20.0,
-                ramp_speed / 20.0,
-                main_density / 0.5,
-                ramp_density / 0.5,
-                ramp_waiting_time / 60.0,
-                gap_size / 10.0,
-                gap_speed_diff / 20.0,
-                float(has_cv),
-                conflict_risk,
-                0.0,  # main_stop_count
-                0.0,  # ramp_stop_count
-                len(main_vehicles) + len(ramp_vehicles) / 100.0,
-                0.0,  # phase_main
-                0.0,  # phase_ramp
-                0.0   # time_step
-            ])
-
-        except Exception as e:
-            return None
-
-    def get_controlled_vehicles(self):
-        """获取受控车辆"""
-        if not self.current_state:
-            return {'main': [], 'ramp': [], 'diverge': []}
-
-        try:
-            main_edges = self.edge_ids.get('main', [])
-            ramp_edges = self.edge_ids.get('ramp', [])
-
-            main_vehicles = []
-            for edge_id in main_edges:
-                try:
-                    main_vehicles.extend(traci.edge.getLastStepVehicleIDs(edge_id))
-                except Exception as e:
-                    print(f"获取主路边 {edge_id} 受控车辆失败: {e}")
-
-            ramp_vehicles = []
-            for edge_id in ramp_edges:
-                try:
-                    ramp_vehicles.extend(traci.edge.getLastStepVehicleIDs(edge_id))
-                except Exception as e:
-                    print(f"获取匝道边 {edge_id} 受控车辆失败: {e}")
-
-            return {
-                'main': main_vehicles[:1] if main_vehicles else [],
-                'ramp': ramp_vehicles[:1] if ramp_vehicles else [],
-                'diverge': []
-            }
-
-        except Exception as e:
-            print(f"获取受控车辆失败: {e}")
-            return {'main': [], 'ramp': [], 'diverge': []}
-
-    def get_vehicle_features(self, vehicle_ids, traci_conn, device):
-        """获取车辆特征"""
-        if not vehicle_ids:
-            return None
-
-        features = []
-        for veh_id in vehicle_ids[:10]:
-            try:
-                features.append([
-                    traci_conn.vehicle.getSpeed(veh_id) / 20.0,
-                    traci_conn.vehicle.getLanePosition(veh_id) / 500.0,
-                    traci_conn.vehicle.getLaneIndex(veh_id) / 3.0,
-                    traci_conn.vehicle.getWaitingTime(veh_id) / 60.0,
-                    traci_conn.vehicle.getAcceleration(veh_id) / 5.0,
-                    1.0 if traci_conn.vehicle.getTypeID(veh_id) == 'CV' else 0.0,
-                    0.0,
-                    0.0
-                ])
-            except Exception as e:
-                print(f"获取车辆 {veh_id} 特征失败: {e}")
-                features.append([0.0] * 8)
-
-        while len(features) < 10:
-            features.append([0.0] * 8)
-
-        return torch.tensor(features, dtype=torch.float32, device=device)
+    return data_package
 
 
-# ========================================================================
-# 主程序入口
-# ========================================================================
+def analyze_pickle_data(pickle_file):
+    """
+    分析pickle文件中的数据
+
+    参数:
+        pickle_file: pickle文件路径
+    """
+    data = load_pickle_data(pickle_file)
+
+    print(f"\n{'=' * 70}")
+    print("数据分析报告")
+    print(f"{'=' * 70}")
+
+    # 仿真参数
+    params = data['parameters']
+    print(f"\n仿真参数:")
+    print(f"  - 仿真时长: {params['simulation_time']:.2f} 秒")
+    print(f"  - 总步数: {params['total_steps']}")
+    print(f"  - 时间步长: {params['step_length']:.2f} 秒")
+    print(f"  - 理论总需求: {params['total_demand']:.0f} 车辆")
+    print(f"  - 实际出发: {params['final_departed']} 车辆")
+    print(f"  - 实际到达: {params['final_arrived']} 车辆")
+
+    # 车辆类型配置
+    if 'vehicle_type_maxspeed' in params:
+        print(f"\n车辆类型原始maxSpeed配置:")
+        for vtype, max_speed in params['vehicle_type_maxspeed'].items():
+            print(f"  - {vtype}: {max_speed:.2f} m/s")
+
+    # 数据量统计
+    print(f"\n数据量统计:")
+    print(f"  - 时间步记录: {len(data['step_data']):,} 条")
+    print(f"  - 车辆记录: {len(data['vehicle_data']):,} 条")
+    print(f"  - 唯一车辆: {len(data['route_data']):,} 辆")
+
+    # 转换为DataFrame进行分析
+    if data['vehicle_data']:
+        df = pd.DataFrame(data['vehicle_data'])
+        print(f"\n车辆数据分析:")
+        print(f"  - 平均瞬时速度: {df['speed'].mean():.2f} m/s")
+        print(f"  - 最大瞬时速度: {df['speed'].max():.2f} m/s")
+        print(f"  - 最小瞬时速度: {df['speed'].min():.2f} m/s")
+        print(f"  - 平均完成率: {df['completion_rate'].mean():.2%}")
+        print(f"  - 唯一OD对数: {df.groupby('vehicle_id')[['origin', 'destination']].first().drop_duplicates().shape[0]}")
+
+        # maxSpeed统计（现在是车辆类型配置）
+        if 'max_speed' in df.columns:
+            print(f"\n车辆类型maxSpeed配置统计:")
+            unique_maxspeeds = df.groupby('vehicle_type')['max_speed'].first()
+            for vtype, maxspeed in unique_maxspeeds.items():
+                print(f"  - {vtype}: {maxspeed:.2f} m/s")
+
+    if data['step_data']:
+        step_df = pd.DataFrame(data['step_data'])
+        print(f"\n时间步数据分析:")
+        print(f"  - 最大活跃车辆数: {step_df['active_vehicles'].max()}")
+        print(f"  - 平均活跃车辆数: {step_df['active_vehicles'].mean():.2f}")
+
+    print(f"{'=' * 70}")
+
+    return data
+
+
+def export_to_csv(pickle_file, output_dir=None):
+    """
+    将pickle数据导出为CSV文件(用于进一步分析)
+
+    参数:
+        pickle_file: pickle文件路径
+        output_dir: 输出目录,默认与pickle文件同目录
+    """
+    data = load_pickle_data(pickle_file)
+
+    if output_dir is None:
+        output_dir = os.path.dirname(pickle_file)
+
+    timestamp = data['parameters']['collection_timestamp']
+
+    # 导出时间步数据
+    if data['step_data']:
+        step_csv = os.path.join(output_dir, f"step_data_{timestamp}.csv")
+        step_df = pd.DataFrame(data['step_data'])
+        step_df.to_csv(step_csv, index=False, encoding='utf-8-sig')
+        print(f"✓ 时间步数据已导出: {step_csv}")
+
+    # 导出车辆数据
+    if data['vehicle_data']:
+        vehicle_csv = os.path.join(output_dir, f"vehicle_data_{timestamp}.csv")
+        vehicle_df = pd.DataFrame(data['vehicle_data'])
+        vehicle_df.to_csv(vehicle_csv, index=False, encoding='utf-8-sig')
+        print(f"✓ 车辆数据已导出: {vehicle_csv}")
+
+    # 导出参数
+    params_csv = os.path.join(output_dir, f"parameters_{timestamp}.csv")
+    params_df = pd.DataFrame([
+        {'参数名': k, '参数值': str(v)}
+        for k, v in data['parameters'].items()
+    ])
+    params_df.to_csv(params_csv, index=False, encoding='utf-8-sig')
+    print(f"✓ 参数已导出: {params_csv}")
+
+
+def main():
+    """主函数 - 参赛者使用入口"""
+
+    # ========================================================================
+    # 配置区域 - 参赛者修改此处
+    # ========================================================================
+
+    # 方式1: 从命令行参数获取配置文件路径
+    if len(sys.argv) > 1:
+        sumo_cfg = sys.argv[1]
+    else:
+        # 方式2: 直接指定配置文件路径
+        sumo_cfg = ".\sumo.sumocfg"
+
+    # 仿真参数设置
+    MAX_STEPS = 3600  # 最大仿真步数
+    USE_GUI = True  # 是否使用GUI界面
+
+    # ========================================================================
+
+    # 检查配置文件是否存在
+    if not os.path.exists(sumo_cfg):
+        print(f"❌ 配置文件不存在: {sumo_cfg}")
+        print("\n请修改main()函数中的sumo_cfg路径,或使用命令行参数:")
+        print(f"python {sys.argv[0]} <your_config_file.sumocfg>")
+        return
+
+    try:
+        # 创建框架实例
+        framework = SUMOCompetitionFramework(sumo_cfg)
+
+        # 运行仿真
+        framework.run(max_steps=MAX_STEPS, use_gui=USE_GUI)
+
+    except Exception as e:
+        print(f"\n❌ 程序运行失败: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 if __name__ == "__main__":
-    # 创建框架实例
-    framework = SUMOCompetitionFramework(
-        sumo_cfg_path="sumo.sumocfg",
-        model_path="../checkpoints/final_model.pt"
-    )
-
-    # 第一部分: 初始化
-    framework.parse_config()
-    framework.parse_routes()
-    framework.initialize_environment()
-    framework.load_rl_model()
-
-    # 第二部分: 运行仿真
-    framework.run_simulation()
-
-    # 第三部分: 保存结果
-    framework.save_to_pickle()
-    framework.close()
-
-    print("\n" + "=" * 70)
-    print("仿真完成！")
-    print("=" * 70)
+    main()

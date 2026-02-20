@@ -145,7 +145,7 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 raise
 
         def reset(self):
-            """重置环境并应用CACC参数"""
+            """重置环境"""
             try:
                 self._start_sumo()
                 self.current_step = 0
@@ -160,9 +160,6 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
 
                 # 2. 设置订阅（订阅模式优化）
                 self._setup_subscriptions()
-
-                # 3. 应用CACC参数优化（与推理环境完全一致）
-                self._apply_cacc_parameters()
 
                 # ========== 关键修复：刷新订阅数据 ==========
                 # 订阅请求发出后，必须执行一次 simulationStep 才会有数据返回
@@ -273,50 +270,6 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
             except Exception as e:
                 self.logger.error(f"启动SUMO失败: {e}\n{tb.format_exc()}")
                 raise
-
-        def _apply_cacc_parameters(self):
-            """
-            应用CACC参数优化
-
-            核心策略：
-            - sigma=0: 消除随机减速（完美驾驶），提高交通流稳定性
-            - tau=1.12: 微增跟车时距（抵消sigma=0带来的容量增加，保持安全性）
-
-            这个设置与推理环境完全一致，确保训练和推理的动作空间一致。
-            """
-            cacc_applied = set()  # 跟踪已设置的车辆，避免重复设置
-            failed_vehicles = []  # 记录失败的车辆
-
-            try:
-                all_vehicles = traci_wrapper.vehicle.getIDList()
-                self.logger.debug(f"开始应用CACC参数，车辆总数={len(all_vehicles)}")
-
-                for veh_id in all_vehicles:
-                    if veh_id in cacc_applied:
-                        continue
-
-                    try:
-                        # 只对CV（Connected Vehicle）类型应用CACC参数
-                        veh_type = traci_wrapper.vehicle.getTypeID(veh_id)
-                        if veh_type == 'CV':
-                            # 设置imperfection（sigma）为0，消除随机减速
-                            traci_wrapper.vehicle.setImperfection(veh_id, 0.0)
-
-                            # 设置tau（跟车时距）为1.12秒，略微增大以保持安全距离
-                            traci_wrapper.vehicle.setTau(veh_id, 1.12)
-
-                            cacc_applied.add(veh_id)
-                    except Exception as e:
-                        # 车辆可能在设置过程中离开路网，记录但不中断
-                        failed_vehicles.append((veh_id, str(e)))
-
-                self.logger.info(f"CACC参数应用完成: 成功={len(cacc_applied)}辆, 失败={len(failed_vehicles)}辆")
-                if failed_vehicles and len(failed_vehicles) <= 5:
-                    for veh_id, err in failed_vehicles[:5]:
-                        self.logger.debug(f"  车辆 {veh_id} 设置失败: {err}")
-
-            except Exception as e:
-                self.logger.error(f"应用CACC参数时发生错误: {e}\n{tb.format_exc()}")
 
         def _apply_actions(self, actions):
             """应用动作到车辆"""

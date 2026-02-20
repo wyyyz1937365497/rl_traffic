@@ -573,28 +573,26 @@ class InterJunctionCoordinator(nn.Module):
 
 class MultiJunctionModel(nn.Module):
     """
-    多路口联合模型
-    整合所有路口的策略网络和协调模块
+    多路口联合模型（改进版 - 使用差异化网络架构）
+    为不同类型的路口使用专门的网络结构
     """
-    
+
     def __init__(self, junction_configs: Dict, config: NetworkConfig = None):
         super().__init__()
-        
+
         if config is None:
             config = NetworkConfig()
-        
+
         self.config = config
-        
-        # 为每个路口创建策略网络
-        self.junction_policies = nn.ModuleDict()
-        for junc_id, junc_config in junction_configs.items():
-            self.junction_policies[junc_id] = JunctionPolicyNetwork(
-                junc_config.junction_type, config
-            )
-        
+        self.junction_configs = junction_configs
+
+        # 使用自适应网络架构
+        from adaptive_networks import AdaptiveJunctionNetwork
+        self.adaptive_network = AdaptiveJunctionNetwork(junction_configs)
+
         # 路口间协调
         self.coordinator = InterJunctionCoordinator()
-        
+
         # 全局价值网络
         self.global_value = nn.Sequential(
             nn.Linear(64 * len(junction_configs), 128),
@@ -606,48 +604,95 @@ class MultiJunctionModel(nn.Module):
                 vehicle_observations: Dict[str, Dict[str, torch.Tensor]] = None,
                 deterministic: bool = False) -> Tuple[Dict[str, Dict], Dict[str, torch.Tensor], Dict]:
         """
-        前向传播
-        
+        前向传播（使用自适应网络架构）
+
         Args:
             observations: {路口ID: [batch, state_dim]}
             vehicle_observations: {路口ID: {'main': [...], 'ramp': [...], 'diverge': [...]}}
             deterministic: 是否确定性策略
-        
+
         Returns:
             all_actions: {路口ID: {'main': action, 'ramp': action, ...}}
             all_values: {路口ID: value}
             all_info: 额外信息
         """
+        from torch.distributions import Categorical
+
         all_actions = {}
         all_values = {}
         all_info = {}
         junction_features = {}
-        
+
         for junc_id, state in observations.items():
             # 获取车辆观察
             veh_obs = vehicle_observations.get(junc_id, {}) if vehicle_observations else {}
             main_veh = veh_obs.get('main')
             ramp_veh = veh_obs.get('ramp')
             diverge_veh = veh_obs.get('diverge')
-            
-            # 策略网络
-            policy = self.junction_policies[junc_id]
-            actions, value, info = policy(
-                state, main_veh, ramp_veh, diverge_veh, deterministic
+
+            # 调用自适应网络
+            output = self.adaptive_network(
+                junc_id,
+                state,
+                main_vehicles=main_veh,
+                ramp_vehicles=ramp_veh,
+                diverge_vehicles=diverge_veh
             )
-            
+
+            # 转换输出格式
+            # 从action probabilities中采样
+            main_probs = output['main_action']
+            ramp_probs = output['ramp_action']
+
+            if deterministic:
+                main_action = torch.argmax(main_probs, dim=-1)
+                ramp_action = torch.argmax(ramp_probs, dim=-1)
+            else:
+                main_dist = Categorical(main_probs)
+                ramp_dist = Categorical(ramp_probs)
+                main_action = main_dist.sample()
+                ramp_action = ramp_dist.sample()
+
+            # 构建actions字典
+            actions = {
+                'main': main_action.float() / 10.0,  # 归一化到0-1
+                'ramp': ramp_action.float() / 10.0
+            }
+
+            # 如果有diverge_action（复杂网络）
+            if 'diverge_action' in output:
+                diverge_probs = output['diverge_action']
+                if deterministic:
+                    diverge_action = torch.argmax(diverge_probs, dim=-1)
+                else:
+                    diverge_dist = Categorical(diverge_probs)
+                    diverge_action = diverge_dist.sample()
+                actions['diverge'] = diverge_action.float() / 10.0
+
             all_actions[junc_id] = actions
-            all_values[junc_id] = value
+            all_values[junc_id] = output['value']
+
+            # 构建info
+            info = {
+                'main_probs': main_probs,
+                'ramp_probs': ramp_probs
+            }
+            if 'diverge_action' in output:
+                info['diverge_probs'] = output['diverge_action']
+            if 'conflict_prob' in output:
+                info['conflict_prob'] = output['conflict_prob']
+
             all_info[junc_id] = info
-            
-            # 保存特征用于协调
-            junction_features[junc_id] = policy.policy_net.state_encoder(state)
-        
+
+            # 保存状态编码特征用于协调（使用网络的state_encoder）
+            network = self.adaptive_network.networks[junc_id]
+            junction_features[junc_id] = network.state_encoder(state)
+
         # 路口间协调
         coordinated_features = self.coordinator(junction_features)
 
         # 全局价值（只在所有路口都有输入时计算）
-        if len(coordinated_features) == len(self.junction_policies):
+        if len(coordinated_features) == len(self.adaptive_network.networks):
             global_feat = torch.cat(list(coordinated_features.values()), dim=-1)
             global_value = self.global_value(global_feat)
             all_info['global_value'] = global_value

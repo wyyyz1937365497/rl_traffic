@@ -447,6 +447,9 @@ class JunctionAgent:
         # 动作历史
         self.action_history: List[Dict] = []
 
+        # 奖励分解（用于调试）
+        self.reward_breakdown = {}
+
         # 不在 __init__ 中初始化信号灯相位，等 SUMO 启动后在 setup_subscriptions 中初始化
     
     def _init_traffic_light_phases(self):
@@ -959,33 +962,53 @@ class MultiAgentEnvironment:
                     continue
     
     def _compute_rewards(self) -> Dict[str, float]:
-        """计算奖励"""
-        rewards = {}
-        
-        for junc_id, agent in self.agents.items():
-            state = agent.current_state
-            if state is None:
-                rewards[junc_id] = 0.0
-                continue
-            
-            throughput_reward = -state.main_queue_length * 0.1 - state.ramp_queue_length * 0.2
-            waiting_penalty = -state.ramp_waiting_time * 0.05
-            conflict_penalty = -state.conflict_risk * 0.5
-            gap_reward = state.gap_acceptance * 0.2 if state.ramp_vehicles else 0
-            speed_stability = -abs(state.main_speed - state.ramp_speed) * 0.02
-            
-            signal_reward = 0.0
-            if state.ramp_signal == 'G' and state.ramp_vehicles:
-                signal_reward = 0.1
-            elif state.ramp_signal == 'r' and state.ramp_vehicles:
-                signal_reward = -0.1 * len(state.ramp_vehicles)
-            
-            total_reward = (throughput_reward + waiting_penalty + conflict_penalty + 
-                          gap_reward + speed_stability + signal_reward)
-            
-            rewards[junc_id] = total_reward
-        
-        return rewards
+        """计算奖励（改进版，包含正向奖励）"""
+        # 导入改进的奖励计算器
+        from improved_rewards import ImprovedRewardCalculator
+
+        if not hasattr(self, 'reward_calculator'):
+            self.reward_calculator = ImprovedRewardCalculator()
+
+        # 获取环境统计信息
+        env_stats = {
+            'ocr': self._compute_current_ocr(),
+            'step': self.current_step
+        }
+
+        return self.reward_calculator.compute_rewards(self.agents, env_stats)
+
+    def _compute_current_ocr(self) -> float:
+        """计算当前OCR"""
+        try:
+            import traci
+
+            # 到达车辆数
+            arrived = traci.simulation.getArrivedNumber()
+
+            # 总车辆数
+            total = traci.vehicle.getIDCount()
+
+            if total == 0:
+                return 0.0
+
+            # 在途车辆完成度
+            inroute_completion = 0.0
+            for veh_id in traci.vehicle.getIDList():
+                try:
+                    route_idx = traci.vehicle.getRouteIndex(veh_id)
+                    route_len = len(traci.vehicle.getRoute(veh_id))
+                    if route_len > 0:
+                        inroute_completion += route_idx / route_len
+                except:
+                    continue
+
+            # OCR = (到达 + 在途完成度) / 总数
+            ocr = (arrived + inroute_completion) / total
+            return min(ocr, 1.0)
+
+        except Exception as e:
+            print(f"计算OCR失败: {e}")
+            return 0.0
     
     def _is_done(self) -> bool:
         """检查是否结束"""
