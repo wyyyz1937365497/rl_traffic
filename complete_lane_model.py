@@ -48,156 +48,163 @@ class LaneConflict:
 
 
 # ============================================================================
-# 第二部分：基于路网分析的完整车道冲突矩阵
+# 第二部分：基于 EDGE_TOPOLOGY 和 LANE_CONFLICTS 的完整车道冲突矩阵
+# ============================================================================
+# 数据来源：road_topology_hardcoded.py
 # ============================================================================
 
-# 完整的车道冲突定义（基于路网分析）
+# 完整的车道冲突定义（基于路网拓扑和车道级冲突矩阵）
 LANE_CONFLICTS = {
-    # ==================== J5 路口 ====================
-    # E23匝道汇入J5
+    # ==================== J5 路口：E23匝道汇入-E2 ====================
+    # 拓扑：E23 → -E2，与 -E3 来车在 -E2 上冲突
+    # LANE_CONFLICTS: 'E23_0': ['-E3_0']
     'E23_0': LaneConflict(
         lane_id='E23_0',
-        conflicts_with=['-E3_0'],  # 与主路下游两条车道都冲突
+        conflicts_with=['-E3_0'],  # 与反向主路上游来车冲突
         conflict_type=ConflictType.MERGE,
         severity=0.8,
-        description="匝道E23汇入主路，与-E3_0条车道冲突"
-    ),
-    
-    # -E3是主路下游（反向），被匝道汇入
-    '-E3_0': LaneConflict(
-        lane_id='-E3_0',
-        conflicts_with=['E23_0'],  # 与匝道冲突
-        conflict_type=ConflictType.MERGE,
-        severity=0.8,
-        description="主路最外侧车道，与匝道汇入冲突"
-    ),
-    # ==================== J14 路口 ====================
-    # E15匝道汇入J14
-    'E15_0': LaneConflict(
-        lane_id='E15_0',
-        conflicts_with=['-E9_0'],
-        conflict_type=ConflictType.MERGE,
-        severity=0.8,
-        description="匝道E15汇入主路，与-E9_0条车道冲突"
-    ),
-    
-    '-E9_0': LaneConflict(
-        lane_id='-E9_0',
-        conflicts_with=['E15_0'],
-        conflict_type=ConflictType.MERGE,
-        severity=0.8,
-        description="主路最外侧车道，与匝道汇入冲突"
-    ),
-    '-E9_1': LaneConflict(
-        lane_id='-E9_1',
-        conflicts_with=[],  # 不与匝道冲突！
-        conflict_type=ConflictType.MERGE,
-        severity=0.0,
-        description="主路最内侧车道，不与匝道冲突"
+        description="匝道E23汇入-E2，与-E3来车在-E2上冲突"
     ),
 
-    
-    # ==================== J15 路口（复杂：汇入+转出）====================
-    # E17匝道汇入J15
-    'E17_0': LaneConflict(
-        lane_id='E17_0',
-        conflicts_with=['-E11_0', '-E11_1'],  # 注意：-E11有3条车道，只与前2条冲突
+    '-E3_0': LaneConflict(
+        lane_id='-E3_0',
+        conflicts_with=['E23_0'],
         conflict_type=ConflictType.MERGE,
         severity=0.8,
-        description="匝道E17汇入主路，与-E11前两条车道冲突，不与-E11_2冲突"
+        description="反向主路最外侧车道，与E23匝道汇入冲突"
     ),
-    
+
+    # ==================== J14 路口：E15匝道汇入E10 ====================
+    # 拓扑：E15 → E10，与 E9 来车在 E10 上冲突
+    # LANE_CONFLICTS: 'E15_0': ['E9_0'] (注意是正向E9，不是反向-E9)
+    'E15_0': LaneConflict(
+        lane_id='E15_0',
+        conflicts_with=['E9_0'],  # 与正向主路上游来车冲突
+        conflict_type=ConflictType.MERGE,
+        severity=0.7,
+        description="匝道E15汇入E10，与E9来车在E10上冲突"
+    ),
+
+    'E9_0': LaneConflict(
+        lane_id='E9_0',
+        conflicts_with=['E15_0'],
+        conflict_type=ConflictType.MERGE,
+        severity=0.7,
+        description="正向主路最外侧车道，与E15匝道汇入冲突"
+    ),
+    'E9_1': LaneConflict(
+        lane_id='E9_1',
+        conflicts_with=[],  # 不与匝道冲突
+        conflict_type=ConflictType.MERGE,
+        severity=0.0,
+        description="正向主路内侧车道，不与匝道冲突"
+    ),
+
+
+    # ==================== J15 路口：E17匝道汇入-E10 + E16转出 ====================
+    # 拓扑：E17 → -E10，与 -E11 来车在 -E10 上冲突
+    # LANE_CONFLICTS: 'E17_0': ['-E11_0', '-E11_1'] (关键：不与-E11_2冲突！)
+    'E17_0': LaneConflict(
+        lane_id='E17_0',
+        conflicts_with=['-E11_0', '-E11_1'],  # 只与前2条车道冲突
+        conflict_type=ConflictType.MERGE,
+        severity=0.8,
+        description="匝道E17汇入-E10，与-E11前两条车道冲突，不与-E11_2冲突"
+    ),
+
     '-E11_0': LaneConflict(
         lane_id='-E11_0',
         conflicts_with=['E17_0'],
         conflict_type=ConflictType.MERGE,
         severity=0.8,
-        description="主路最外侧车道，与匝道汇入冲突，同时可转出E16"
+        description="反向主路最外侧车道，与E17匝道汇入冲突，可转出E16"
     ),
     '-E11_1': LaneConflict(
         lane_id='-E11_1',
         conflicts_with=['E17_0'],
         conflict_type=ConflictType.MERGE,
         severity=0.8,
-        description="主路中间车道，与匝道汇入冲突"
+        description="反向主路中间车道，与E17匝道汇入冲突"
     ),
     '-E11_2': LaneConflict(
         lane_id='-E11_2',
         conflicts_with=[],  # 不与匝道冲突！
         conflict_type=ConflictType.MERGE,
         severity=0.0,
-        description="主路最内侧车道，不与匝道冲突"
+        description="反向主路最内侧车道，不与匝道冲突"
     ),
-    
+
     # E16转出匝道
     'E16_0': LaneConflict(
         lane_id='E16_0',
-        conflicts_with=[],  # 与主路转出车辆冲突
+        conflicts_with=[],
         conflict_type=ConflictType.DIVERGE,
         severity=0.5,
-        description="转出匝道，不与匝道冲突"
+        description="转出匝道E16第一车道"
     ),
     'E16_1': LaneConflict(
         lane_id='E16_1',
-        conflicts_with=[],  # 与反向主路和匝道冲突
+        conflicts_with=[],
         conflict_type=ConflictType.DIVERGE,
-        severity=0.7,
-        description="转出匝道第二车道,不与匝道冲突"
+        severity=0.5,
+        description="转出匝道E16第二车道"
     ),
-    
-    # ==================== J17 路口（复杂：汇入+转出）====================
-    # E19匝道汇入J17（注意：E19有2条车道）
+
+    # ==================== J17 路口：E19匝道汇入-E12 + E18/E20转出 ====================
+    # 拓扑：E19 → -E12，与 -E13 来车在 -E12 上冲突
+    # LANE_CONFLICTS: 'E19_0': ['-E13_0', '-E13_1'], 'E19_1': ['-E13_0', '-E13_1']
+    # 关键：不与 -E13_2 冲突！
     'E19_0': LaneConflict(
         lane_id='E19_0',
-        conflicts_with=['-E13_0'],  # 与前两条车道冲突
+        conflicts_with=['-E13_0', '-E13_1'],  # 与前2条车道都冲突
         conflict_type=ConflictType.MERGE,
         severity=0.8,
-        description="匝道E19第一车道汇入主路"
+        description="匝道E19第一车道汇入-E12，与-E13前两条车道冲突"
     ),
     'E19_1': LaneConflict(
         lane_id='E19_1',
-        conflicts_with=['-E13_1'],  # 只与最外侧冲突
+        conflicts_with=['-E13_0', '-E13_1'],  # 也与前2条车道都冲突
         conflict_type=ConflictType.MERGE,
         severity=0.8,
-        description="匝道E19第二车道汇入主路"
+        description="匝道E19第二车道汇入-E12，与-E13前两条车道冲突"
     ),
-    
+
     '-E13_0': LaneConflict(
         lane_id='-E13_0',
         conflicts_with=['E19_0', 'E19_1'],
         conflict_type=ConflictType.MERGE,
         severity=0.8,
-        description="主路最外侧车道，与匝道汇入冲突，同时可转出E20"
+        description="反向主路最外侧车道，与E19匝道两条车道都冲突，可转出E20"
     ),
     '-E13_1': LaneConflict(
         lane_id='-E13_1',
-        conflicts_with=['E19_0','E19_1'],
+        conflicts_with=['E19_0', 'E19_1'],
         conflict_type=ConflictType.MERGE,
         severity=0.8,
-        description="主路中间车道，与匝道汇入冲突较轻"
+        description="反向主路中间车道，与E19匝道两条车道都冲突"
     ),
     '-E13_2': LaneConflict(
         lane_id='-E13_2',
         conflicts_with=[],  # 不与匝道冲突！
         conflict_type=ConflictType.MERGE,
         severity=0.0,
-        description="主路最内侧车道，不与匝道冲突"
+        description="反向主路最内侧车道，不与匝道冲突"
     ),
-    
+
     # E18, E20转出匝道
     'E18_0': LaneConflict(
         lane_id='E18_0',
-        conflicts_with=['E12_0'],
+        conflicts_with=[],
         conflict_type=ConflictType.DIVERGE,
         severity=0.0,
         description="转出匝道E18"
     ),
     'E20_0': LaneConflict(
         lane_id='E20_0',
-        conflicts_with=[],  # 不与匝道冲突
+        conflicts_with=[],
         conflict_type=ConflictType.DIVERGE,
         severity=0.0,
-        description="转出匝道E20，不与匝道冲突"
+        description="转出匝道E20"
     ),
 }
 

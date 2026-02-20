@@ -1,0 +1,11 @@
+{
+  "iteration": 35,
+  "timestamp": "2026-02-20T15:02:34.888207",
+  "model_path": "checkpoints/checkpoint_iter_0035.pt",
+  "statistics": {
+    "total_departed": 4884,
+    "total_arrived": 4608,
+    "completion_rate": 0.9434889434889435
+  },
+  "pickle_file": "checkpoints/evaluations\\iter_0035\\competition_submission.pkl"
+}

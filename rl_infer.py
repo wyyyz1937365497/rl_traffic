@@ -376,8 +376,10 @@ def run_inference(args):
             if controlled['main'] and 'main' in action:
                 for veh_id in controlled['main'][:1]:
                     action_value = action['main'].item()
-                    # 将连续动作转换为速度调整
-                    target_speed = 15.0 + action_value * 10.0  # [15, 25] m/s
+                    # 将连续动作转换为速度调整（使用SUMO真实限速）
+                    speed_limit = 13.89  # 50 km/h - SUMO配置
+                    target_speed = speed_limit * (0.3 + 0.9 * action_value)  # [4.17, 15.67] m/s
+                    target_speed = max(0.0, min(target_speed, speed_limit * 1.2))  # 限制在合理范围
                     try:
                         traci.vehicle.setSpeed(veh_id, target_speed)
                         action_dict[junc_id][veh_id] = target_speed
@@ -387,8 +389,10 @@ def run_inference(args):
             if controlled['ramp'] and 'ramp' in action:
                 for veh_id in controlled['ramp'][:1]:
                     action_value = action['ramp'].item()
-                    # 调整匝道车辆速度
-                    target_speed = 10.0 + action_value * 10.0  # [10, 20] m/s
+                    # 调整匝道车辆速度（使用SUMO真实限速）
+                    speed_limit = 13.89  # 50 km/h - SUMO配置
+                    target_speed = speed_limit * (0.3 + 0.9 * action_value)  # [4.17, 15.67] m/s
+                    target_speed = max(0.0, min(target_speed, speed_limit * 1.2))  # 限制在合理范围
                     try:
                         traci.vehicle.setSpeed(veh_id, target_speed)
                         action_dict[junc_id][veh_id] = target_speed

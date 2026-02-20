@@ -38,38 +38,54 @@ class LaneConflict:
     severity: float        # 冲突严重程度 (0-1)
 
 
-# 预定义车道级冲突关系（基于路网拓扑）
+# 预定义车道级冲突关系（基于路网拓扑和 EDGE_TOPOLOGY）
+# 数据来源：road_topology_hardcoded.py 的 LANE_CONFLICTS
 LANE_CONFLICTS = {
-    # J15: 匝道E17汇入主路E11
-    'E17_0': LaneConflict(
-        lane_id='E17_0',
-        conflicts_with=['-E11_0', '-E11_1'],  # 匝道与主路最外侧两条车道冲突
-        conflict_type='merge',
-        severity=0.8
-    ),
-    
-    # J17: 匝道E19汇入主路E13
-    'E19_0': LaneConflict(
-        lane_id='E19_0',
-        conflicts_with=['-E13_0', '-E13_1'],
-        conflict_type='merge',
-        severity=0.8
-    ),
-    
-    # J5: 匝道E23汇入主路E3
+    # ==================== J5: E23匝道汇入-E2 ====================
+    # 拓扑：E23 → -E2，与 -E3 来车在 -E2 上冲突
+    # LANE_CONFLICTS: 'E23_0': ['-E3_0']
     'E23_0': LaneConflict(
         lane_id='E23_0',
-        conflicts_with=['-E3_0', '-E3_1'],
+        conflicts_with=['-E3_0'],  # 与反向主路上游来车冲突
+        conflict_type='merge',
+        severity=0.8
+    ),
+
+    # ==================== J14: E15匝道汇入-E9 ====================
+    # 拓扑：E15 → E10，与 E9 来车在 E10 上冲突
+    # LANE_CONFLICTS: 'E15_0': ['E9_0'] (注意是正向E9，不是反向-E9)
+    'E15_0': LaneConflict(
+        lane_id='E15_0',
+        conflicts_with=['E9_0'],  # 与正向主路上游来车冲突
         conflict_type='merge',
         severity=0.7
     ),
-    
-    # J14: 匝道E15汇入主路E10
-    'E15_0': LaneConflict(
-        lane_id='E15_0',
-        conflicts_with=['-E10_0', '-E10_1'],
+
+    # ==================== J15: E17匝道汇入-E10 ====================
+    # 拓扑：E17 → -E10，与 -E11 来车在 -E10 上冲突
+    # LANE_CONFLICTS: 'E17_0': ['-E11_0', '-E11_1'] (关键：不与-E11_2冲突！)
+    'E17_0': LaneConflict(
+        lane_id='E17_0',
+        conflicts_with=['-E11_0', '-E11_1'],  # 只与前2条车道冲突，不与-E11_2冲突
         conflict_type='merge',
-        severity=0.7
+        severity=0.8
+    ),
+
+    # ==================== J17: E19匝道汇入-E12 ====================
+    # 拓扑：E19 → -E12，与 -E13 来车在 -E12 上冲突
+    # LANE_CONFLICTS: 'E19_0': ['-E13_0', '-E13_1'], 'E19_1': ['-E13_0', '-E13_1']
+    # 关键：不与 -E13_2 冲突！
+    'E19_0': LaneConflict(
+        lane_id='E19_0',
+        conflicts_with=['-E13_0', '-E13_1'],  # 只与前2条车道冲突，不与-E13_2冲突
+        conflict_type='merge',
+        severity=0.8
+    ),
+    'E19_1': LaneConflict(
+        lane_id='E19_1',
+        conflicts_with=['-E13_0', '-E13_1'],  # 第二条匝道车道也只与前2条车道冲突
+        conflict_type='merge',
+        severity=0.8
     ),
 }
 

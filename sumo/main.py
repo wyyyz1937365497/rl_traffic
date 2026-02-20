@@ -225,9 +225,11 @@ class SUMOCompetitionFramework:
             # 创建智能体
             import traci
             for junc_id, junc_config in JUNCTION_CONFIGS.items():
-                sub_manager = SubscriptionManager(junc_id)
-                sub_manager.setup_subscriptions()
-                self.agents[junc_id] = JunctionAgent(junc_config, sub_manager)
+                # 创建智能体（SubscriptionManager 会在 JunctionAgent 内部创建）
+                agent = JunctionAgent(junc_config)
+                # 设置订阅（这是 JunctionAgent 的方法）
+                agent.setup_subscriptions()
+                self.agents[junc_id] = agent
 
             self.model_loaded = True
             print(f"[OK] RL模型已加载: {model_path}")
@@ -350,29 +352,27 @@ class SUMOCompetitionFramework:
             vehicle_obs = {}
 
             for junc_id, agent in self.agents.items():
-                # observe() 不接受参数
+                # 关键修复：更新订阅数据
+                agent.sub_manager.update_results()
+
+                # 使用 observe() 更新状态
                 state = agent.observe()
                 if state is not None:
-                    # 将JunctionState转换为tensor
+                    # 使用 agent.get_state_vector() 获取标准化的状态向量
                     import torch
-                    state_vec = torch.tensor([
-                        len(state.main_vehicles),  # 主路车辆数
-                        state.main_speed,
-                        state.main_density,
-                        state.main_queue_length,
-                        len(state.ramp_vehicles),  # 匝道车辆数
-                        state.ramp_speed,
-                        state.ramp_queue_length,
-                        state.current_phase if state.current_phase is not None else 0
-                    ], dtype=torch.float32).unsqueeze(0).to(self.device)
+                    state_vec = torch.tensor(
+                        agent.get_state_vector(),
+                        dtype=torch.float32
+                    ).unsqueeze(0).to(self.device)
 
                     obs_tensors[junc_id] = state_vec
 
                     # 获取受控车辆特征
                     controlled = agent.get_controlled_vehicles()
                     vehicle_obs[junc_id] = {
-                        'main': self._get_vehicle_tensor(controlled.get('main', [])),
-                        'ramp': self._get_vehicle_tensor(controlled.get('ramp', []))
+                        'main': self._get_vehicle_features(controlled.get('main', [])),
+                        'ramp': self._get_vehicle_features(controlled.get('ramp', [])),
+                        'diverge': self._get_vehicle_features(controlled.get('diverge', []))
                     }
 
             if not obs_tensors:
@@ -380,7 +380,7 @@ class SUMOCompetitionFramework:
 
             # 模型推理
             with torch.no_grad():
-                actions, _, _ = self.model(obs_tensors, vehicle_obs, deterministic=True)
+                actions, values, info = self.model(obs_tensors, vehicle_obs, deterministic=True)
 
             # 应用控制动作
             self._apply_actions(actions)
@@ -390,25 +390,60 @@ class SUMOCompetitionFramework:
             traceback.print_exc()
             pass
 
-    def _get_vehicle_tensor(self, vehicle_ids):
-        """将车辆ID列表转换为特征tensor"""
+    def _get_vehicle_features(self, vehicle_ids):
+        """
+        将车辆ID列表转换为特征tensor（与训练代码一致）
+
+        特征维度（8个）:
+        1. normalize_speed(speed)
+        2. position / 500
+        3. lane_index / 3
+        4. waiting_time / 60
+        5. acceleration / 5
+        6. is_CV (0 or 1)
+        7. route_index / 10
+        8. 0.0 (padding)
+        """
         import torch
+
         if not vehicle_ids:
+            # 返回空tensor
             return None
 
+        MAX_VEHICLES = 10  # 最多10辆车
+        GLOBAL_MAX_SPEED = 55.5556  # 全局最大速度
+
         features = []
-        for veh_id in vehicle_ids[:5]:  # 最多5辆车
+        for veh_id in vehicle_ids[:MAX_VEHICLES]:
             try:
                 speed = traci.vehicle.getSpeed(veh_id)
+                position = traci.vehicle.getLanePosition(veh_id)
+                lane_index = traci.vehicle.getLaneIndex(veh_id)
+                waiting_time = traci.vehicle.getWaitingTime(veh_id)
                 accel = traci.vehicle.getAcceleration(veh_id)
-                features.append([speed, accel])
-            except:
-                features.append([0.0, 0.0])
+                vtype = traci.vehicle.getTypeID(veh_id)
+                route_index = traci.vehicle.getRouteIndex(veh_id)
 
-        # 填充到5辆车
-        while len(features) < 5:
-            features.append([0.0, 0.0])
+                # 归一化特征
+                features.append([
+                    min(speed / GLOBAL_MAX_SPEED, 1.0),  # normalize_speed
+                    position / 500.0,
+                    lane_index / 3.0,
+                    waiting_time / 60.0,
+                    accel / 5.0,
+                    1.0 if vtype == 'CV' else 0.0,
+                    route_index / 10.0,
+                    0.0  # padding
+                ])
+            except Exception as e:
+                # 如果获取失败，填充零向量
+                features.append([0.0] * 8)
 
+        # 如果车辆数少于MAX_VEHICLES，填充零向量
+        while len(features) < MAX_VEHICLES:
+            features.append([0.0] * 8)
+
+        # 转换为tensor: [1, MAX_VEHICLES, 8]
         return torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(self.device)
 
     def _apply_actions(self, actions):
@@ -678,8 +713,8 @@ class SUMOCompetitionFramework:
             }
         }
 
-        # 保存pickle文件
-        pickle_file = os.path.join(output_dir, f"submit.pkl")
+        # 保存pickle文件 - 使用比赛要求的文件名
+        pickle_file = os.path.join(output_dir, f"competition_submission.pkl")
 
         with open(pickle_file, 'wb') as f:
             pickle.dump(data_package, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -937,7 +972,7 @@ def main():
         sumo_cfg = sys.argv[1]
     else:
         # 方式2: 直接指定配置文件路径
-        sumo_cfg = ".\sumo.sumocfg"
+        sumo_cfg = ".\sumo\sumo.sumocfg"
 
     # 仿真参数设置
     MAX_STEPS = 3600  # 最大仿真步数

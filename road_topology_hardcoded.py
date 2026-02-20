@@ -26,9 +26,19 @@ class EdgeInfo:
 
 EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     # ==================== 主路正向 ====================
+    'E1': EdgeInfo(
+        edge_id='E1',
+        from_junction='',
+        to_junction='',
+        num_lanes=2,
+        downstream=['E2'],
+        upstream=[],
+        is_ramp=False,
+        is_main=True
+    ),
     'E2': EdgeInfo(
         edge_id='E2',
-        from_junction='J4',
+        from_junction='',
         to_junction='J5',
         num_lanes=2,
         downstream=['E3'],
@@ -39,7 +49,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     'E3': EdgeInfo(
         edge_id='E3',
         from_junction='J5',
-        to_junction='J6',
+        to_junction='',
         num_lanes=2,
         downstream=['E5'],
         upstream=['E2'],
@@ -48,8 +58,8 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     ),
     'E5': EdgeInfo(
         edge_id='E5',
-        from_junction='J6',
-        to_junction='J10',
+        from_junction='',
+        to_junction='',
         num_lanes=2,
         downstream=['E6'],
         upstream=['E3'],
@@ -58,7 +68,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     ),
     'E6': EdgeInfo(
         edge_id='E6',
-        from_junction='J10',
+        from_junction='',
         to_junction='J11',
         num_lanes=2,
         downstream=['E7'],
@@ -71,7 +81,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
         from_junction='J11',
         to_junction='J12',
         num_lanes=3,
-        downstream=['E8'],
+        downstream=['E8','E24'],
         upstream=['E6'],
         is_ramp=False,
         is_main=True
@@ -79,7 +89,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     'E8': EdgeInfo(
         edge_id='E8',
         from_junction='J12',
-        to_junction='J13',
+        to_junction='',
         num_lanes=2,
         downstream=['E9'],
         upstream=['E7'],
@@ -88,7 +98,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     ),
     'E9': EdgeInfo(
         edge_id='E9',
-        from_junction='J13',
+        from_junction='',
         to_junction='J14',
         num_lanes=2,
         downstream=['E10'],
@@ -101,7 +111,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
         from_junction='J14',
         to_junction='J15',
         num_lanes=2,
-        downstream=['E11', 'E16'],  # 可直行或转出
+        downstream=['E11'],  # 可直行或转出
         upstream=['E9', 'E15'],
         is_ramp=False,
         is_main=True
@@ -109,16 +119,16 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     'E11': EdgeInfo(
         edge_id='E11',
         from_junction='J15',
-        to_junction='J16',
+        to_junction='',
         num_lanes=3,
         downstream=['E12'],
-        upstream=['E10', 'E17'],
+        upstream=['E10'],
         is_ramp=False,
         is_main=True
     ),
     'E12': EdgeInfo(
         edge_id='E12',
-        from_junction='J16',
+        from_junction='',
         to_junction='J17',
         num_lanes=3,
         downstream=['E13', 'E18'],  # 可直行或转出
@@ -132,16 +142,26 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
         to_junction='J18',
         num_lanes=2,
         downstream=[],
-        upstream=['E12', 'E19'],
+        upstream=['E12'],
         is_ramp=False,
         is_main=True
     ),
     
     # ==================== 主路反向 ====================
+    '-E1': EdgeInfo(
+        edge_id='-E1',
+        from_junction='',
+        to_junction='',
+        num_lanes=2,
+        downstream=[''],
+        upstream=['-E2'],  # E23匝道汇入
+        is_ramp=False,
+        is_main=True
+    ),
     '-E2': EdgeInfo(
         edge_id='-E2',
         from_junction='J5',
-        to_junction='J4',
+        to_junction='',
         num_lanes=2,
         downstream=['-E1'],
         upstream=['-E3', 'E23'],  # E23匝道汇入
@@ -150,7 +170,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     ),
     '-E3': EdgeInfo(
         edge_id='-E3',
-        from_junction='J6',
+        from_junction='',
         to_junction='J5',
         num_lanes=2,
         downstream=['-E2'],
@@ -160,8 +180,8 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     ),
     '-E5': EdgeInfo(
         edge_id='-E5',
-        from_junction='J10',
-        to_junction='J6',
+        from_junction='',
+        to_junction='',
         num_lanes=2,
         downstream=['-E3'],
         upstream=['-E6'],
@@ -171,7 +191,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     '-E6': EdgeInfo(
         edge_id='-E6',
         from_junction='J11',
-        to_junction='J10',
+        to_junction='',
         num_lanes=2,
         downstream=['-E5'],
         upstream=['-E7'],
@@ -190,7 +210,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     ),
     '-E8': EdgeInfo(
         edge_id='-E8',
-        from_junction='J13',
+        from_junction='',
         to_junction='J12',
         num_lanes=2,
         downstream=['-E7'],
@@ -201,10 +221,10 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     '-E9': EdgeInfo(
         edge_id='-E9',
         from_junction='J14',
-        to_junction='J13',
+        to_junction='',
         num_lanes=2,
         downstream=['-E8'],
-        upstream=['-E10', 'E15'],  # E15匝道汇入
+        upstream=['-E10'],  # E15匝道汇入
         is_ramp=False,
         is_main=True
     ),
@@ -220,7 +240,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     ),
     '-E11': EdgeInfo(
         edge_id='-E11',
-        from_junction='J16',
+        from_junction='',
         to_junction='J15',
         num_lanes=3,
         downstream=['-E10', 'E16'],  # 可直行或转出
@@ -231,7 +251,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     '-E12': EdgeInfo(
         edge_id='-E12',
         from_junction='J17',
-        to_junction='J16',
+        to_junction='',
         num_lanes=3,
         downstream=['-E11'],
         upstream=['-E13', 'E19'],  # E19匝道汇入
@@ -240,7 +260,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     ),
     '-E13': EdgeInfo(
         edge_id='-E13',
-        from_junction='J18',
+        from_junction='',
         to_junction='J17',
         num_lanes=3,
         downstream=['-E12', 'E20'],  # 可直行或转出
@@ -252,7 +272,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     # ==================== 匝道（汇入）====================
     'E23': EdgeInfo(
         edge_id='E23',
-        from_junction='J31',
+        from_junction='',
         to_junction='J5',
         num_lanes=1,
         downstream=['-E2'],  # 汇入主路
@@ -262,7 +282,7 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     ),
     'E15': EdgeInfo(
         edge_id='E15',
-        from_junction='J23',
+        from_junction='',
         to_junction='J14',
         num_lanes=1,
         downstream=['E10'],  # 汇入主路
@@ -272,20 +292,20 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     ),
     'E17': EdgeInfo(
         edge_id='E17',
-        from_junction='J25',
+        from_junction='',
         to_junction='J15',
         num_lanes=1,
-        downstream=['E16', '-E10'],  # 可转出或汇入
+        downstream=['-E10'],  # 可转出或汇入
         upstream=[],
         is_ramp=True,
         is_main=False
     ),
     'E19': EdgeInfo(
         edge_id='E19',
-        from_junction='J27',
+        from_junction='',
         to_junction='J17',
         num_lanes=2,
-        downstream=['E20', '-E12'],  # 可转出或汇入
+        downstream=['-E12'],  # 可转出或汇入
         upstream=[],
         is_ramp=True,
         is_main=False
@@ -295,17 +315,17 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     'E16': EdgeInfo(
         edge_id='E16',
         from_junction='J15',
-        to_junction='J24',
+        to_junction='',
         num_lanes=2,
         downstream=[],
-        upstream=['E10', '-E11'],
+        upstream=['-E11'],
         is_ramp=True,
         is_main=False
     ),
     'E18': EdgeInfo(
         edge_id='E18',
         from_junction='J17',
-        to_junction='J26',
+        to_junction='',
         num_lanes=1,
         downstream=[],
         upstream=['E12'],
@@ -315,10 +335,10 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
     'E20': EdgeInfo(
         edge_id='E20',
         from_junction='J17',
-        to_junction='J28',
+        to_junction='',
         num_lanes=1,
         downstream=[],
-        upstream=['-E13', 'E19'],
+        upstream=['-E13'],
         is_ramp=True,
         is_main=False
     ),
@@ -331,17 +351,17 @@ EDGE_TOPOLOGY: Dict[str, EdgeInfo] = {
 
 LANE_CONFLICTS: Dict[str, List[str]] = {
     # J5: E23匝道汇入-E2
-    'E23_0': ['-E2_0', '-E2_1'],  # 匝道与主路最外侧两条车道冲突
+    'E23_0': ['-E3_0'],  # 匝道与主路最外侧两条车道冲突
     
     # J14: E15匝道汇入-E9
-    'E15_0': ['-E10_0', '-E10_1'],
+    'E15_0': ['E9_0'],
     
     # J15: E17匝道汇入-E10（关键：只与前2条车道冲突）
     'E17_0': ['-E11_0', '-E11_1'],  # 不与-E11_2冲突！
     
     # J17: E19匝道汇入-E12（关键：只与前2条车道冲突）
     'E19_0': ['-E13_0', '-E13_1'],  # 不与-E13_2冲突！
-    'E19_1': ['-E13_0'],  # 第二条匝道车道只与最外侧冲突
+    'E19_1': ['-E13_0', '-E13_1'],  # 第二条匝道车道只与最外侧冲突
 }
 
 

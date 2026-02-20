@@ -155,20 +155,28 @@ class JunctionConfig:
     junction_id: str
     junction_type: JunctionType
     control_zone: ControlZone
-    
+
     # 道路配置
     main_incoming: List[str] = field(default_factory=list)
     main_outgoing: List[str] = field(default_factory=list)
     ramp_incoming: List[str] = field(default_factory=list)
     ramp_outgoing: List[str] = field(default_factory=list)
-    
+    reverse_incoming: List[str] = field(default_factory=list)  # 反向主路上游（与匝道冲突的方向）
+    reverse_outgoing: List[str] = field(default_factory=list)  # 反向主路下游（匝道汇入边）
+
+    # 车道级冲突信息（新增）
+    num_main_lanes: int = 0        # 主路车道数
+    num_ramp_lanes: int = 0        # 匝道车道数
+    conflict_lanes: List[str] = field(default_factory=list)  # 冲突车道列表
+
     # 信号灯配置
     has_traffic_light: bool = False
     tl_id: str = ""
     num_phases: int = 2
 
 
-# 更新路口配置，包含控制区域
+# 更新路口配置，包含控制区域和车道级冲突信息
+# 基于 EDGE_TOPOLOGY 和 LANE_CONFLICTS 更新
 JUNCTION_CONFIGS = {
     'J5': JunctionConfig(
         junction_id='J5',
@@ -177,11 +185,16 @@ JUNCTION_CONFIGS = {
         main_incoming=['E2'],
         main_outgoing=['E3'],
         ramp_incoming=['E23'],
+        reverse_incoming=['-E3'],  # 反向主路上游（与匝道冲突的方向）
+        reverse_outgoing=['-E2'],  # 反向主路下游（匝道汇入边）
+        num_main_lanes=2,
+        num_ramp_lanes=1,
+        conflict_lanes=['-E3_0'],  # E23_0 与 -E3_0 冲突
         has_traffic_light=True,
         tl_id='J5',
         num_phases=2
     ),
-    
+
     'J14': JunctionConfig(
         junction_id='J14',
         junction_type=JunctionType.TYPE_A,
@@ -189,11 +202,16 @@ JUNCTION_CONFIGS = {
         main_incoming=['E9'],
         main_outgoing=['E10'],
         ramp_incoming=['E15'],
+        reverse_incoming=['-E10'],
+        reverse_outgoing=['-E9'],
+        num_main_lanes=2,
+        num_ramp_lanes=1,
+        conflict_lanes=['E9_0'],  # E15_0 与 E9_0 冲突（注意是E9不是-E9）
         has_traffic_light=True,
         tl_id='J14',
         num_phases=2
     ),
-    
+
     'J15': JunctionConfig(
         junction_id='J15',
         junction_type=JunctionType.TYPE_B,
@@ -202,11 +220,16 @@ JUNCTION_CONFIGS = {
         main_outgoing=['E11'],
         ramp_incoming=['E17'],
         ramp_outgoing=['E16'],
+        reverse_incoming=['-E11'],  # 反向主路上游（与匝道冲突的方向）
+        reverse_outgoing=['-E10'],  # 反向主路下游（匝道汇入边）
+        num_main_lanes=3,
+        num_ramp_lanes=1,
+        conflict_lanes=['-E11_0', '-E11_1'],  # E17_0 只与前2条车道冲突
         has_traffic_light=True,
         tl_id='J15',
         num_phases=2
     ),
-    
+
     'J17': JunctionConfig(
         junction_id='J17',
         junction_type=JunctionType.TYPE_B,
@@ -215,6 +238,11 @@ JUNCTION_CONFIGS = {
         main_outgoing=['E13'],
         ramp_incoming=['E19'],
         ramp_outgoing=['E18', 'E20'],
+        reverse_incoming=['-E13'],  # 反向主路上游（与匝道冲突的方向）
+        reverse_outgoing=['-E12'],  # 反向主路下游（匝道汇入边）
+        num_main_lanes=3,
+        num_ramp_lanes=2,
+        conflict_lanes=['-E13_0', '-E13_1'],  # E19_0, E19_1 只与前2条车道冲突
         has_traffic_light=True,
         tl_id='J17',
         num_phases=2

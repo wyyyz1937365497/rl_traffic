@@ -61,7 +61,7 @@ class PPOConfig:
     max_grad_norm: float = 0.5  # 梯度裁剪
     
     # 训练参数
-    batch_size: int = 64
+    batch_size: int = 2048
     n_epochs: int = 10  # 每次更新的epoch数
     update_frequency: int = 2048  # 更新频率（步数）
     
@@ -83,11 +83,11 @@ class EnvironmentConfig:
     delta_time: float = 1.0  # 仿真步长（秒）
     
     # 控制参数
-    control_interval: int = 5  # 控制间隔（步数）
+    control_interval: int = 0  # 控制间隔（步数）
     cv_ratio: float = 0.25  # 智能网联车比例
     
     # 状态参数
-    max_vehicles: int = 200  # 最大车辆数
+    max_vehicles: int = 300  # 最大车辆数
     history_length: int = 10  # 历史状态长度
     detection_range: float = 500.0  # 检测范围（米）
     

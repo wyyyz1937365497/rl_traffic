@@ -153,6 +153,10 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 for agent in self.agents.values():
                     agent.state_history.clear()
 
+                # 重置奖励计算器
+                if hasattr(self, 'reward_calculator'):
+                    self.reward_calculator.reset()
+
                 # 1. 初始热身步进
                 for _ in range(10):
                     traci_wrapper.simulationStep()
@@ -290,33 +294,82 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 self.logger.debug(f"总计 {failed_count} 个车辆速度设置失败")
 
         def _compute_rewards(self):
-            """计算奖励"""
-            rewards = {}
-            for junc_id, agent in self.agents.items():
-                try:
-                    state = agent.current_state
-                    if state is None:
-                        rewards[junc_id] = 0.0
-                        continue
+            """计算奖励（使用改进版，包含正向奖励）"""
+            # 使用改进的奖励计算器
+            from improved_rewards import ImprovedRewardCalculator
 
-                    throughput = -state.main_queue_length * 0.1 - state.ramp_queue_length * 0.2
-                    waiting = -state.ramp_waiting_time * 0.05
-                    conflict = -state.conflict_risk * 0.5
-                    gap = state.gap_acceptance * 0.2 if state.ramp_vehicles else 0
-                    speed_stability = -abs(state.main_speed - state.ramp_speed) * 0.02
+            if not hasattr(self, 'reward_calculator'):
+                self.reward_calculator = ImprovedRewardCalculator()
 
-                    reward = throughput + waiting + conflict + gap + speed_stability
-                    rewards[junc_id] = reward
+            # 获取环境统计信息
+            try:
+                ocr = self._compute_current_ocr()
+            except:
+                ocr = 0.0
 
-                    # 调试：每1000步打印一次奖励详情
-                    if self.current_step % 1000 == 0 and self.current_step > 0:
-                        self.logger.info(f"路口 {junc_id} 奖励: {reward:.4f} (队列:{state.main_queue_length:.1f}/{state.ramp_queue_length:.1f}, 等待:{state.ramp_waiting_time:.1f})")
+            env_stats = {
+                'ocr': ocr,
+                'step': self.current_step
+            }
 
-                except Exception as e:
-                    self.logger.warning(f"计算路口 {junc_id} 奖励失败: {e}")
-                    rewards[junc_id] = 0.0
+            rewards = self.reward_calculator.compute_rewards(self.agents, env_stats)
+
+            # 调试：每1000步打印一次奖励详情
+            if self.current_step % 1000 == 0 and self.current_step > 0:
+                for junc_id, reward in rewards.items():
+                    agent = self.agents.get(junc_id)
+                    if agent and hasattr(agent, 'reward_breakdown') and agent.reward_breakdown:
+                        bd = agent.reward_breakdown
+                        self.logger.info(
+                            f"路口 {junc_id} 奖励: {reward:.4f} "
+                            f"[departure:{bd.get('departure_reward', 0):.2f}, "
+                            f"flow:{bd.get('flow_reward', 0):.2f}, "
+                            f"speed:{bd.get('speed_reward', 0):.2f}, "
+                            f"gap:{bd.get('gap_reward', 0):.2f}, "
+                            f"no_stops:{bd.get('no_stops_reward', 0):.2f}, "
+                            f"capacity:{bd.get('capacity_reward', 0):.2f}, "
+                            f"queue:{bd.get('queue_penalty', 0):.2f}, "
+                            f"wait:{bd.get('waiting_penalty', 0):.2f}, "
+                            f"conflict:{bd.get('conflict_penalty', 0):.2f}, "
+                            f"survival:{bd.get('survival_bonus', 0):.2f}]"
+                        )
+                    else:
+                        self.logger.info(f"路口 {junc_id} 奖励: {reward:.4f}")
 
             return rewards
+
+        def _compute_current_ocr(self) -> float:
+            """计算当前OCR"""
+            try:
+                import traci
+
+                # 到达车辆数
+                arrived = traci.simulation.getArrivedNumber()
+
+                # 总车辆数
+                total = traci.vehicle.getIDCount()
+
+                if total == 0:
+                    return 0.0
+
+                # 在途车辆完成度
+                inroute_completion = 0.0
+                for veh_id in traci.vehicle.getIDList():
+                    try:
+                        route_idx = traci.vehicle.getRouteIndex(veh_id)
+                        route_len = len(traci.vehicle.getRoute(veh_id))
+                        if route_len > 0:
+                            inroute_completion += route_idx / route_len
+                    except:
+                        continue
+
+                # OCR = (到达 + 在途完成度) / 总数
+                ocr = (arrived + inroute_completion) / total
+                return min(ocr, 1.0)
+
+            except Exception as e:
+                self.logger.debug(f"计算OCR失败: {e}")
+                return 0.0
 
         def close(self):
             """关闭环境"""
@@ -839,7 +892,7 @@ def main():
     parser.add_argument('--sumo-cfg', type=str, required=True, help='SUMO配置文件')
     parser.add_argument('--total-timesteps', type=int, default=1000000, help='总训练步数')
     parser.add_argument('--lr', type=float, default=3e-4, help='学习率')
-    parser.add_argument('--batch-size', type=int, default=64, help='批大小')
+    parser.add_argument('--batch-size', type=int, default=2048, help='批大小')
     parser.add_argument('--num-envs', type=int, default=4, help='并行环境数量')
     parser.add_argument('--workers', type=int, help='工作进程数（默认=CPU核心数）')
     parser.add_argument('--update-frequency', type=int, default=2048, help='更新频率')
