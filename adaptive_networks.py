@@ -106,6 +106,9 @@ class SimpleMergeNetwork(nn.Module):
             nn.ReLU()
         )
 
+        # 车辆特征投影：8维 -> 16维
+        self.vehicle_proj = nn.Linear(8, 16)
+
         # 简单注意力
         self.attention = nn.MultiheadAttention(16, 2, batch_first=True)
 
@@ -124,26 +127,55 @@ class SimpleMergeNetwork(nn.Module):
 
         # 价值头
         self.value_head = nn.Linear(64, 1)
-    
+
     def forward(self, state, main_vehicles=None, ramp_vehicles=None, **kwargs):
         # 编码状态
         state_feat = self.state_encoder(state)
-        
-        # 简单注意力
-        if main_vehicles is not None and ramp_vehicles is not None:
-            combined = torch.cat([main_vehicles, ramp_vehicles], dim=1)
-            attn_out, _ = self.attention(combined, combined, combined)
-            attn_feat = attn_out.mean(dim=1)
-        else:
-            attn_feat = torch.zeros(state.size(0), 16, device=state.device)
-        
+        batch_size = state.size(0)
+
+        # 处理车辆特征（分别处理以避免batch不匹配）
+        attn_feat = torch.zeros(batch_size, 16, device=state.device)
+
+        if main_vehicles is not None and main_vehicles.size(0) > 0:
+            # 投影并处理主路车辆
+            if main_vehicles.size(0) != batch_size:
+                # 如果batch不匹配，取最小的
+                actual_batch = min(batch_size, main_vehicles.size(0))
+                main_vehicles = main_vehicles[:actual_batch]
+                state_feat_batch = state_feat[:actual_batch]
+            else:
+                state_feat_batch = state_feat
+
+            main_proj = self.vehicle_proj(main_vehicles)  # [batch, N, 8] -> [batch, N, 16]
+            main_attn_out, _ = self.attention(main_proj, main_proj, main_proj)
+            main_attn_feat = main_attn_out.mean(dim=1)  # [batch, 16]
+
+            # 累加到注意力特征
+            attn_feat[:main_attn_feat.size(0)] += main_attn_feat
+
+        if ramp_vehicles is not None and ramp_vehicles.size(0) > 0:
+            # 投影并处理匝道车辆
+            if ramp_vehicles.size(0) != batch_size:
+                actual_batch = min(batch_size, ramp_vehicles.size(0))
+                ramp_vehicles = ramp_vehicles[:actual_batch]
+                state_feat_batch = state_feat[:actual_batch]
+            else:
+                state_feat_batch = state_feat
+
+            ramp_proj = self.vehicle_proj(ramp_vehicles)  # [batch, M, 8] -> [batch, M, 16]
+            ramp_attn_out, _ = self.attention(ramp_proj, ramp_proj, ramp_proj)
+            ramp_attn_feat = ramp_attn_out.mean(dim=1)  # [batch, 16]
+
+            # 累加到注意力特征
+            attn_feat[:ramp_attn_feat.size(0)] += ramp_attn_feat
+
         # 控制输出
         control_feat = torch.cat([state_feat, attn_feat], dim=-1)
-        
+
         main_action = F.softmax(self.main_control(control_feat), dim=-1)
         ramp_action = F.softmax(self.ramp_control(control_feat), dim=-1)
         value = self.value_head(state_feat)
-        
+
         return {
             'main_action': main_action,
             'ramp_action': ramp_action,
@@ -162,7 +194,7 @@ class ComplexMergeDivergeNetwork(nn.Module):
     
     def __init__(self, state_dim: int = 23):
         super().__init__()
-        
+
         # 深层状态编码器
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, 128),
@@ -172,80 +204,94 @@ class ComplexMergeDivergeNetwork(nn.Module):
             nn.LayerNorm(64),
             nn.ReLU()
         )
-        
+
+        # 车辆特征投影：8维 -> 16维
+        self.vehicle_proj = nn.Linear(8, 16)
+
         # 三方注意力
         self.tri_attention = nn.ModuleDict({
             'main_ramp': nn.MultiheadAttention(16, 4, batch_first=True),
             'main_diverge': nn.MultiheadAttention(16, 4, batch_first=True),
             'ramp_diverge': nn.MultiheadAttention(16, 4, batch_first=True)
         })
-        
+
         # 协调模块
         self.coordinator = nn.Sequential(
             nn.Linear(64 + 16 + 16, 64),
             nn.ReLU(),
             nn.Linear(64, 32)
         )
-        
+
         # 多控制头
         self.main_control = nn.Sequential(
             nn.Linear(64 + 32, 32),
             nn.ReLU(),
             nn.Linear(32, 11)
         )
-        
+
         self.ramp_control = nn.Sequential(
             nn.Linear(64 + 32, 32),
             nn.ReLU(),
             nn.Linear(32, 11)
         )
-        
+
         self.diverge_control = nn.Sequential(
             nn.Linear(64 + 32, 32),
             nn.ReLU(),
             nn.Linear(32, 11)
         )
-        
+
         # 价值头
         self.value_head = nn.Sequential(
             nn.Linear(64 + 32, 32),
             nn.ReLU(),
             nn.Linear(32, 1)
         )
-    
+
     def forward(self, state, main_vehicles=None, ramp_vehicles=None, diverge_vehicles=None, **kwargs):
         batch_size = state.size(0)
         device = state.device
-        
+
         # 编码状态
         state_feat = self.state_encoder(state)
-        
-        # 三方注意力
+
+        # 三方注意力（分别处理以避免batch不匹配）
         main_att = torch.zeros(batch_size, 16, device=device)
         ramp_att = torch.zeros(batch_size, 16, device=device)
         diverge_att = torch.zeros(batch_size, 16, device=device)
-        
-        if main_vehicles is not None and ramp_vehicles is not None:
-            # 主路-匝道注意力
-            combined = torch.cat([main_vehicles, ramp_vehicles], dim=1)
-            attn_out, _ = self.tri_attention['main_ramp'](combined, combined, combined)
-            main_att = attn_out[:, :main_vehicles.size(1), :].mean(dim=1)
-            ramp_att = attn_out[:, main_vehicles.size(1):, :].mean(dim=1)
-        
-        if diverge_vehicles is not None:
-            diverge_att = diverge_vehicles.mean(dim=1) if diverge_vehicles.dim() == 3 else diverge_vehicles
-        
+
+        if main_vehicles is not None and main_vehicles.size(0) > 0:
+            # 确保batch匹配
+            actual_batch = min(batch_size, main_vehicles.size(0))
+            main_vehicles = main_vehicles[:actual_batch]
+            main_proj = self.vehicle_proj(main_vehicles)
+            main_attn_out, _ = self.tri_attention['main_ramp'](main_proj, main_proj, main_proj)
+            main_att[:actual_batch] = main_attn_out.mean(dim=1)
+
+        if ramp_vehicles is not None and ramp_vehicles.size(0) > 0:
+            actual_batch = min(batch_size, ramp_vehicles.size(0))
+            ramp_vehicles = ramp_vehicles[:actual_batch]
+            ramp_proj = self.vehicle_proj(ramp_vehicles)
+            ramp_attn_out, _ = self.tri_attention['main_ramp'](ramp_proj, ramp_proj, ramp_proj)
+            ramp_att[:actual_batch] = ramp_attn_out.mean(dim=1)
+
+        if diverge_vehicles is not None and diverge_vehicles.size(0) > 0:
+            actual_batch = min(batch_size, diverge_vehicles.size(0))
+            diverge_vehicles = diverge_vehicles[:actual_batch]
+            diverge_proj = self.vehicle_proj(diverge_vehicles)
+            diverge_att[:actual_batch] = diverge_proj.mean(dim=1) if diverge_proj.dim() == 3 else diverge_proj
+
         # 协调
         coord_feat = self.coordinator(torch.cat([state_feat, ramp_att, diverge_att], dim=-1))
-        
+
         # 控制输出
         control_feat = torch.cat([state_feat, coord_feat], dim=-1)
-        
+
         main_action = F.softmax(self.main_control(control_feat), dim=-1)
         ramp_action = F.softmax(self.ramp_control(control_feat), dim=-1)
         diverge_action = F.softmax(self.diverge_control(control_feat), dim=-1)
         value = self.value_head(control_feat)
-        
+
         return {
             'main_action': main_action,
             'ramp_action': ramp_action,
@@ -265,7 +311,7 @@ class HighConflictNetwork(nn.Module):
     
     def __init__(self, state_dim: int = 23):
         super().__init__()
-        
+
         # 深层状态编码器
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, 256),
@@ -278,7 +324,10 @@ class HighConflictNetwork(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(128, 64)
         )
-        
+
+        # 车辆特征投影：8维 -> 16维
+        self.vehicle_proj = nn.Linear(8, 16)
+
         # 冲突预测模块
         self.conflict_predictor = nn.Sequential(
             nn.Linear(64 + 16, 32),
@@ -286,83 +335,96 @@ class HighConflictNetwork(nn.Module):
             nn.Linear(32, 1),
             nn.Sigmoid()
         )
-        
+
         # 多层注意力
         self.attention_layers = nn.ModuleList([
             nn.MultiheadAttention(16, 4, batch_first=True)
             for _ in range(3)
         ])
-        
+
         # 保守策略模块
         self.conservative_policy = nn.Sequential(
             nn.Linear(64 + 16 + 1, 32),  # +1 for conflict prob
             nn.ReLU(),
             nn.Linear(32, 16)
         )
-        
+
         # 控制头
         self.main_control = nn.Sequential(
             nn.Linear(64 + 16 + 16, 32),
             nn.ReLU(),
             nn.Linear(32, 11)
         )
-        
+
         self.ramp_control = nn.Sequential(
             nn.Linear(64 + 16 + 16, 32),
             nn.ReLU(),
             nn.Linear(32, 11)
         )
-        
+
         self.diverge_control = nn.Sequential(
             nn.Linear(64 + 16 + 16, 32),
             nn.ReLU(),
             nn.Linear(32, 11)
         )
-        
+
         # 价值头
         self.value_head = nn.Sequential(
             nn.Linear(64 + 16 + 16 + 1, 32),
             nn.ReLU(),
             nn.Linear(32, 1)
         )
-    
+
     def forward(self, state, main_vehicles=None, ramp_vehicles=None, diverge_vehicles=None, **kwargs):
         batch_size = state.size(0)
         device = state.device
-        
+
         # 编码状态
         state_feat = self.state_encoder(state)
-        
-        # 多层注意力
+
+        # 多层注意力（分别处理以避免batch不匹配）
         attn_feat = torch.zeros(batch_size, 16, device=device)
-        
-        if main_vehicles is not None and ramp_vehicles is not None:
-            combined = torch.cat([main_vehicles, ramp_vehicles], dim=1)
-            
+
+        if main_vehicles is not None and main_vehicles.size(0) > 0:
+            actual_batch = min(batch_size, main_vehicles.size(0))
+            main_vehicles = main_vehicles[:actual_batch]
+            main_proj = self.vehicle_proj(main_vehicles)
+
             for attn_layer in self.attention_layers:
-                attn_out, _ = attn_layer(combined, combined, combined)
-                combined = combined + attn_out  # 残差连接
-            
-            attn_feat = combined.mean(dim=1)
-        
+                attn_out, _ = attn_layer(main_proj, main_proj, main_proj)
+                main_proj = main_proj + attn_out  # 残差连接
+
+            attn_feat[:actual_batch] += main_proj.mean(dim=1)
+
+        if ramp_vehicles is not None and ramp_vehicles.size(0) > 0:
+            actual_batch = min(batch_size, ramp_vehicles.size(0))
+            ramp_vehicles = ramp_vehicles[:actual_batch]
+            ramp_proj = self.vehicle_proj(ramp_vehicles)
+
+            for attn_layer in self.attention_layers:
+                attn_out, _ = attn_layer(ramp_proj, ramp_proj, ramp_proj)
+                ramp_proj = ramp_proj + attn_out  # 残差连接
+
+            attn_feat[:actual_batch] += ramp_proj.mean(dim=1)
+
         # 冲突预测
         conflict_prob = self.conflict_predictor(torch.cat([state_feat, attn_feat], dim=-1))
-        
+
         # 保守策略
         conservative_feat = self.conservative_policy(
             torch.cat([state_feat, attn_feat, conflict_prob], dim=-1)
         )
-        
+
         # 控制输出
         control_feat = torch.cat([state_feat, attn_feat, conservative_feat], dim=-1)
-        
+
         main_action = F.softmax(self.main_control(control_feat), dim=-1)
         ramp_action = F.softmax(self.ramp_control(control_feat), dim=-1)
         diverge_action = F.softmax(self.diverge_control(control_feat), dim=-1)
-        
+
         # 价值（考虑冲突风险）
         value = self.value_head(torch.cat([control_feat, conflict_prob], dim=-1))
-        
+
         return {
             'main_action': main_action,
             'ramp_action': ramp_action,

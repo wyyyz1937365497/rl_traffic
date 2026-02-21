@@ -27,7 +27,7 @@ def normalize_speed(speed, max_speed=None):
     归一化速度到 [0, 1]
 
     Args:
-        speed: 速度值 (m/s)
+        speed: 速度值 (m/s) - 可以是 float 或 Tensor
         max_speed: 该车辆类型的最大速度，如果为None则使用全局最大速度
 
     Returns:
@@ -36,7 +36,12 @@ def normalize_speed(speed, max_speed=None):
     if max_speed is None:
         max_speed = GLOBAL_MAX_SPEED
 
-    return torch.clamp(speed / max_speed, 0.0, 1.0)
+    normalized = speed / max_speed
+    # 如果是 Tensor，使用 torch.clamp；否则使用 Python 的 min/max
+    if hasattr(normalized, 'clamp'):
+        return torch.clamp(normalized, 0.0, 1.0)
+    else:
+        return max(0.0, min(normalized, 1.0))
 
 
 def denormalize_speed(normalized_speed, max_speed=None):
@@ -44,7 +49,7 @@ def denormalize_speed(normalized_speed, max_speed=None):
     反归一化速度
 
     Args:
-        normalized_speed: 归一化速度 [0, 1]
+        normalized_speed: 归一化速度 [0, 1] - 可以是 float 或 Tensor
         max_speed: 该车辆类型的最大速度，如果为None则使用全局最大速度
 
     Returns:
@@ -53,7 +58,12 @@ def denormalize_speed(normalized_speed, max_speed=None):
     if max_speed is None:
         max_speed = GLOBAL_MAX_SPEED
 
-    return torch.clamp(normalized_speed * max_speed, 0.0, max_speed)
+    denormalized = normalized_speed * max_speed
+    # 如果是 Tensor，使用 torch.clamp；否则使用 Python 的 min/max
+    if hasattr(denormalized, 'clamp'):
+        return torch.clamp(denormalized, 0.0, max_speed)
+    else:
+        return max(0.0, min(denormalized, max_speed))
 
 
 def get_vehicle_max_speed(vehicle_type):

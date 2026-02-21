@@ -10,6 +10,9 @@
 import os
 import sys
 
+# 强制使用 traci 而不是 libsumo（确保与评估框架使用同一个SUMO实例）
+os.environ["USE_LIBSUMO"] = "0"
+
 # 设置控制台编码为UTF-8（Windows兼容）
 if sys.platform == 'win32':
     import locale

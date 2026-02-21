@@ -306,6 +306,7 @@ class SUMOCompetitionFramework:
             try:
                 self._apply_rl_control(step)
             except Exception as e:
+                print("模型加载失败")
                 # 静默失败，不影响仿真
                 pass
 
@@ -341,46 +342,95 @@ class SUMOCompetitionFramework:
 
         pass  # 默认不执行任何控制算法
 
-    def _apply_rl_control(self, step):
-        """使用RL模型进行控制（可选功能）"""
-        # 移除 step < 10 的限制，让模型从第一步就开始控制
-        # if step < 10:
-        #     return
+    def _get_all_vehicles_direct(self, edge_ids):
+        """直接从边获取所有车辆信息（与训练格式一致）"""
+        vehicles = []
+        for edge_id in edge_ids:
+            try:
+                veh_ids = traci.edge.getLastStepVehicleIDs(edge_id)
+                for veh_id in veh_ids:
+                    try:
+                        vtype = traci.vehicle.getTypeID(veh_id)
+                        vehicles.append({
+                            'id': veh_id,
+                            'speed': traci.vehicle.getSpeed(veh_id),
+                            'position': (0, 0),  # 简化
+                            'lane': traci.vehicle.getLaneIndex(veh_id),
+                            'lane_position': traci.vehicle.getLanePosition(veh_id),
+                            'edge': edge_id,
+                            'waiting_time': traci.vehicle.getWaitingTime(veh_id),
+                            'accel': traci.vehicle.getAcceleration(veh_id),
+                            'is_cv': vtype == 'CV',
+                            'route_index': 0
+                        })
+                    except:
+                        continue
+            except:
+                continue
+        # 按位置排序
+        vehicles.sort(key=lambda v: -v['lane_position'])
+        return vehicles
 
+    def _get_cv_vehicles_direct(self, edge_ids):
+        """直接从边获取CV车辆ID列表（不使用订阅）"""
+        cv_vehicles = []
+        for edge_id in edge_ids:
+            try:
+                veh_ids = traci.edge.getLastStepVehicleIDs(edge_id)
+                for veh_id in veh_ids:
+                    try:
+                        vtype = traci.vehicle.getTypeID(veh_id)
+                        if vtype == 'CV':
+                            cv_vehicles.append(veh_id)
+                    except:
+                        continue
+            except:
+                continue
+        return cv_vehicles
+
+    def _apply_rl_control(self, step):
+        """使用RL模型进行控制（与训练代码相同的方式）"""
         try:
-            # 收集所有智能体的观察
+            import torch
+
+            # 订阅新出现的车辆（关键：traci需要手动订阅每辆车）
+            current_vehicles = set(traci.vehicle.getIDList())
+            for agent in self.agents.values():
+                new_vehicles = current_vehicles - agent.sub_manager.subscribed_vehicles
+                if new_vehicles:
+                    agent.sub_manager.setup_vehicle_subscription(list(new_vehicles))
+
             obs_tensors = {}
             vehicle_obs = {}
 
             for junc_id, agent in self.agents.items():
-                # 关键修复：更新订阅数据
+                # 更新订阅数据（与训练代码相同）
                 agent.sub_manager.update_results()
 
-                # 使用 observe() 更新状态
+                # 使用 observe() 获取状态（与训练代码相同）
                 state = agent.observe()
-                if state is not None:
-                    # 调试：打印车辆信息
-                    if step % 100 == 0 and step > 0:
-                        cv_main = len(state.cv_vehicles_main)
-                        cv_ramp = len(state.cv_vehicles_ramp)
-                        print(f"[{junc_id}] 主路CV: {cv_main}, 匝道CV: {cv_ramp}, 总车辆: {len(state.main_vehicles)+len(state.ramp_vehicles)}")
+                if state is None:
+                    continue
 
-                    # 使用 agent.get_state_vector() 获取标准化的状态向量
-                    import torch
-                    state_vec = torch.tensor(
-                        agent.get_state_vector(),
-                        dtype=torch.float32
-                    ).unsqueeze(0).to(self.device)
+                # 调试：打印车辆信息
+                if step % 100 == 0 and step > 0:
+                    print(f"[{junc_id}] 主路CV: {len(state.cv_vehicles_main)}, 匝道CV: {len(state.cv_vehicles_ramp)}, 总车辆: {len(state.main_vehicles)+len(state.ramp_vehicles)}")
 
-                    obs_tensors[junc_id] = state_vec
+                # 如果没有任何CV车辆，跳过此路口
+                if not state.cv_vehicles_main and not state.cv_vehicles_ramp:
+                    continue
 
-                    # 获取受控车辆特征
-                    controlled = agent.get_controlled_vehicles()
-                    vehicle_obs[junc_id] = {
-                        'main': self._get_vehicle_features(controlled.get('main', [])),
-                        'ramp': self._get_vehicle_features(controlled.get('ramp', [])),
-                        'diverge': self._get_vehicle_features(controlled.get('diverge', []))
-                    }
+                # 使用 agent.get_state_vector() 获取状态向量（与训练代码相同）
+                state_vec = agent.get_state_vector()
+                obs_tensors[junc_id] = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+                # 获取受控车辆特征（与训练代码相同）
+                controlled = agent.get_controlled_vehicles()
+                vehicle_obs[junc_id] = {
+                    'main': self._get_vehicle_features(controlled['main']),
+                    'ramp': self._get_vehicle_features(controlled['ramp']),
+                    'diverge': self._get_vehicle_features(controlled['diverge']) if controlled['diverge'] else None
+                }
 
             if not obs_tensors:
                 return
@@ -390,7 +440,7 @@ class SUMOCompetitionFramework:
                 actions, values, info = self.model(obs_tensors, vehicle_obs, deterministic=True)
 
             # 应用控制动作
-            self._apply_actions(actions)
+            self._apply_actions_direct(actions)
 
             # 调试：每100步打印一次控制信息
             if step % 100 == 0 and step > 0:
@@ -401,24 +451,90 @@ class SUMOCompetitionFramework:
             print(f"[RL控制错误] 步骤 {step}: {e}")
             traceback.print_exc()
 
-    def _get_vehicle_features(self, vehicle_ids):
-        """
-        将车辆ID列表转换为特征tensor（与训练代码一致）
+    def _get_mean_speed_direct(self, edge_ids):
+        """直接计算边的平均速度"""
+        speeds = []
+        for edge_id in edge_ids:
+            try:
+                veh_ids = traci.edge.getLastStepVehicleIDs(edge_id)
+                for veh_id in veh_ids:
+                    try:
+                        speed = traci.vehicle.getSpeed(veh_id)
+                        speeds.append(speed)
+                    except:
+                        continue
+            except:
+                continue
+        return sum(speeds) / len(speeds) if speeds else 0.0
 
-        特征维度（8个）:
-        1. speed / 20.0
-        2. position / 500
-        3. lane_index / 3
-        4. waiting_time / 60
-        5. acceleration / 5
-        6. is_CV (0 or 1)
-        7. route_index / 10
-        8. 0.0 (padding)
-        """
+    def _get_queue_length_direct(self, edge_ids):
+        """直接计算排队长度（速度<0.1m/s的车辆）"""
+        queue_count = 0
+        for edge_id in edge_ids:
+            try:
+                veh_ids = traci.edge.getLastStepVehicleIDs(edge_id)
+                for veh_id in veh_ids:
+                    try:
+                        speed = traci.vehicle.getSpeed(veh_id)
+                        if speed < 0.1:
+                            queue_count += 1
+                    except:
+                        continue
+            except:
+                continue
+        return queue_count
+
+    def _apply_actions_direct(self, actions):
+        """直接应用控制动作到CV车辆"""
+        total_controlled = 0
+
+        for junc_id, action in actions.items():
+            if junc_id not in self.agents:
+                continue
+
+            agent = self.agents[junc_id]
+            config = agent.config
+
+            # 直接获取CV车辆
+            main_cv = self._get_cv_vehicles_direct(config.main_incoming)
+            ramp_cv = self._get_cv_vehicles_direct(config.ramp_incoming)
+
+            # 控制主路CV车辆
+            if main_cv and 'main' in action:
+                for veh_id in main_cv[:5]:
+                    try:
+                        action_value = action['main'].item()
+                        speed_limit = 13.89
+                        target_speed = speed_limit * (0.3 + 0.9 * action_value)
+                        target_speed = max(0.0, min(target_speed, speed_limit * 1.2))
+                        traci.vehicle.setSpeed(veh_id, target_speed)
+                        total_controlled += 1
+                    except Exception as e:
+                        continue
+
+            # 控制匝道CV车辆
+            if ramp_cv and 'ramp' in action:
+                for veh_id in ramp_cv[:3]:
+                    try:
+                        action_value = action['ramp'].item()
+                        speed_limit = 13.89
+                        target_speed = speed_limit * (0.3 + 0.9 * action_value)
+                        target_speed = max(0.0, min(target_speed, speed_limit * 1.2))
+                        traci.vehicle.setSpeed(veh_id, target_speed)
+                        total_controlled += 1
+                    except Exception as e:
+                        continue
+
+        # 调试：打印控制的车辆总数
+        if total_controlled > 0 and int(traci.simulation.getTime()) % 100 == 0:
+            print(f"[应用控制] 本次控制了 {total_controlled} 辆CV车")
+
+    def _get_vehicle_features(self, vehicle_ids):
+        """将车辆ID列表转换为特征tensor（与训练代码一致）"""
         import torch
 
         if not vehicle_ids:
-            # 返回空tensor
+            # 与训练代码一致：返回 None
             return None
 
         MAX_VEHICLES = 300  # 最多300辆车
@@ -454,7 +570,8 @@ class SUMOCompetitionFramework:
             features.append([0.0] * 8)
 
         # 转换为tensor: [1, MAX_VEHICLES, 8]
-        return torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(self.device)
+        # 返回2D张量 [N, 8]，让调用者处理batch维度
+        return torch.tensor(features, dtype=torch.float32).to(self.device)
 
     def _apply_actions(self, actions):
         """应用模型输出的动作（只控制CV车辆，符合比赛规定）"""
@@ -818,7 +935,7 @@ class SUMOCompetitionFramework:
                 traci.simulationStep()
 
                 # 第二部分: 应用控制算法
-                self.apply_control_algorithm(step)
+                self._apply_rl_control(step)
 
                 # 第三部分: 收集数据
                 self.collect_step_data(step)

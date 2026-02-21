@@ -707,11 +707,12 @@ class JunctionAgent:
         核心修复：从边订阅数据中获取车辆ID列表，而不是即时查询
         """
         vehicles = []
+        step = int(traci.simulation.getTime())
 
         for edge_id in edge_ids:
             # 1. 从订阅缓存中获取该边的数据
             edge_data = self.sub_manager.get_edge_data(edge_id)
-            
+
             # 2. 获取车辆ID列表 (使用标准常量)
             if edge_data and tc.LAST_STEP_VEHICLE_ID_LIST in edge_data:
                 veh_ids = edge_data[tc.LAST_STEP_VEHICLE_ID_LIST]
@@ -720,8 +721,13 @@ class JunctionAgent:
                 try:
                     veh_ids = traci.edge.getLastStepVehicleIDs(edge_id)
                 except Exception as e:
-                    print(f"获取边 {edge_id} 车辆ID列表失败: {e}")
+                    if step % 100 == 0 and step > 0:
+                        print(f"获取边 {edge_id} 车辆ID列表失败: {e}")
                     continue
+
+            # 调试：每100步打印一次
+            if step % 100 == 0 and step > 0 and len(veh_ids) > 0:
+                print(f"[{self.junction_id}] 边 {edge_id}: {len(veh_ids)} 辆车")
 
             # 3. 获取车辆详细订阅数据
             for veh_id in veh_ids:

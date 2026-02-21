@@ -42,8 +42,8 @@ class ImprovedRewardCalculator:
             'speed_variance': 0.001,         # 速度方差惩罚
         }
 
-        # 奖励裁剪范围
-        self.reward_clip_range = (-10.0, 10.0)  # 扩大裁剪范围，提供更多学习空间
+        # 奖励裁剪范围（移除裁剪）
+        # self.reward_clip_range = (-10.0, 10.0)  # 已移除：让奖励自然分布
 
         # Episode追踪
         self.episode_throughput = defaultdict(int)  # 累计通过量
@@ -172,8 +172,8 @@ class ImprovedRewardCalculator:
             survival_bonus = 0.05  # 小的生存奖励
             total_reward += survival_bonus
 
-            # ===== 奖励裁剪 =====
-            total_reward = max(self.reward_clip_range[0], min(self.reward_clip_range[1], total_reward))
+            # ===== 奖励裁剪（已移除）=====
+            # total_reward = max(self.reward_clip_range[0], min(self.reward_clip_range[1], total_reward))
 
             rewards[junc_id] = total_reward
 

@@ -650,7 +650,8 @@ def _get_vehicle_features(vehicle_ids, device):
     while len(features) < MAX_VEHICLES:
         features.append([0.0] * 8)
 
-    return torch.tensor(features, dtype=torch.float32, device=device).unsqueeze(0)
+    # 返回2D张量 [N, 8]，让收集代码处理batch维度
+    return torch.tensor(features, dtype=torch.float32, device=device)
 
 
 def _compute_log_prob(info, actions):
@@ -953,7 +954,7 @@ def main():
     parser.add_argument('--sumo-cfg', type=str, required=True, help='SUMO配置文件')
     parser.add_argument('--total-timesteps', type=int, default=1000000, help='总训练步数')
     parser.add_argument('--lr', type=float, default=3e-4, help='学习率')
-    parser.add_argument('--batch-size', type=int, default=8192, help='批大小')
+    parser.add_argument('--batch-size', type=int, default=4096, help='批大小')
     parser.add_argument('--num-envs', type=int, default=4, help='并行环境数量')
     parser.add_argument('--workers', type=int, help='工作进程数（默认=CPU核心数）')
     parser.add_argument('--update-frequency', type=int, default=2048, help='更新频率')
