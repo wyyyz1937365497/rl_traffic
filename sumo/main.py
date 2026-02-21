@@ -412,9 +412,6 @@ class SUMOCompetitionFramework:
                 if state is None:
                     continue
 
-                # 调试：打印车辆信息
-                if step % 100 == 0 and step > 0:
-                    print(f"[{junc_id}] 主路CV: {len(state.cv_vehicles_main)}, 匝道CV: {len(state.cv_vehicles_ramp)}, 总车辆: {len(state.main_vehicles)+len(state.ramp_vehicles)}")
 
                 # 如果没有任何CV车辆，跳过此路口
                 if not state.cv_vehicles_main and not state.cv_vehicles_ramp:
@@ -442,9 +439,6 @@ class SUMOCompetitionFramework:
             # 应用控制动作
             self._apply_actions_direct(actions)
 
-            # 调试：每100步打印一次控制信息
-            if step % 100 == 0 and step > 0:
-                print(f"[RL控制] 步骤 {step}: 已应用 {len(actions)} 个路口的控制")
 
         except Exception as e:
             import traceback
@@ -806,11 +800,6 @@ class SUMOCompetitionFramework:
             except Exception as e:
                 continue
 
-        # 进度报告
-        if step % 100 == 0:
-            print(f"[步骤 {step}] 活跃: {len(current_vehicle_ids)}, "
-                  f"累计出发: {self.cumulative_departed}, "
-                  f"累计到达: {self.cumulative_arrived}")
 
     def save_to_pickle(self, output_dir="competition_results"):
         """保存数据到pickle文件"""

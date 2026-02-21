@@ -12,30 +12,69 @@ import json
 # ===== OCR计算辅助函数 =====
 
 def compute_gap_size(main_vehicles: list, ramp_vehicles: list) -> float:
-    """计算间隙大小"""
+    """计算间隙大小（考虑速度和加速度）"""
     if not main_vehicles or not ramp_vehicles:
         return 0.0
-    
-    # 获取主路车辆位置
-    positions = []
+
+    # 获取主路车辆信息（位置、速度、加速度）
+    vehicle_info = []
     for veh in main_vehicles:
         if isinstance(veh, dict):
             pos = veh.get('lane_position', veh.get('position', 0))
+            speed = veh.get('speed', 0)
+            accel = veh.get('accel', veh.get('acceleration', 0))
         else:
-            pos = 0
-        positions.append(pos)
-    
-    if len(positions) < 2:
+            pos, speed, accel = 0, 0, 0
+        vehicle_info.append({'pos': pos, 'speed': speed, 'accel': accel})
+
+    if len(vehicle_info) < 2:
         return 10.0
-    
-    # 排序并计算间隙
-    positions.sort(reverse=True)
+
+    # 按位置排序（从前到后）
+    vehicle_info.sort(key=lambda x: x['pos'], reverse=True)
+
+    # 计算有效间隙（考虑速度和加速度）
     gaps = []
-    for i in range(len(positions) - 1):
-        gap = positions[i] - positions[i + 1]
-        if gap > 5.0:
-            gaps.append(gap)
-    
+    for i in range(len(vehicle_info) - 1):
+        leader = vehicle_info[i]
+        follower = vehicle_info[i + 1]
+
+        # 基础位置间隙
+        pos_gap = leader['pos'] - follower['pos']
+
+        # 速度差（前车速度 - 后车速度）
+        speed_diff = leader['speed'] - follower['speed']
+
+        # 计算时间间隙（秒）
+        if follower['speed'] > 0.1:
+            time_gap = pos_gap / follower['speed']
+        else:
+            time_gap = 999.0  # 后车停止
+
+        # 有效间隙计算
+        # 1. 位置间隙基础分
+        effective_gap = pos_gap
+
+        # 2. 速度调整：如果前车更快，间隙会增大；反之减小
+        # 使用2秒后的预期位置变化
+        speed_adjustment = speed_diff * 2.0
+        effective_gap += speed_adjustment
+
+        # 3. 加速度调整（如果加速度差异大，额外调整）
+        accel_diff = leader.get('accel', 0) - follower.get('accel', 0)
+        accel_adjustment = accel_diff * 1.0  # 1秒的加速度影响
+        effective_gap += accel_adjustment
+
+        # 4. 时间间隙阈值检查（至少2秒安全间隙）
+        min_safe_gap = follower['speed'] * 2.0  # 2秒跟车距离
+        if effective_gap < min_safe_gap and time_gap < 2.0:
+            # 间隙不足，降低有效间隙值
+            effective_gap *= 0.5
+
+        # 只考虑大于5米的间隙
+        if effective_gap > 5.0:
+            gaps.append(effective_gap)
+
     return max(gaps) if gaps else 0.0
 
 def compute_gap_speed_diff(main_vehicles: list, ramp_vehicles: list) -> float:

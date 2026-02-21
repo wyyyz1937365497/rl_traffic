@@ -41,12 +41,12 @@ class PPOConfig:
     
     # 训练参数
     batch_size: int = 2048  # 增大到2048以充分利用GPU并行能力
-    n_epochs: int = 5  # 减少epoch次数，5次通常足够
-    update_frequency: int = 4096  # 增大更新频率，收集更多数据再更新
+    n_epochs: int = 8  # 增加epoch次数（从5提高到8），提高策略优化程度
+    update_frequency: int = 2048  # 减小更新频率，使策略更新更及时
     
     # 探索
-    entropy_decay: float = 0.999
-    entropy_min: float = 0.001
+    entropy_decay: float = 0.9995  # 减慢衰减（从0.999提高到0.9995）
+    entropy_min: float = 0.005     # 提高最小值（从0.001提高到0.005）
 
 
 @dataclass

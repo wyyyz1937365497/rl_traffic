@@ -591,7 +591,7 @@ class JunctionAgent:
     def setup_subscriptions(self):
         """设置该路口的所有订阅"""
         # 初始化信号灯相位信息（此时 SUMO 已启动，只初始化一次）
-        if self.config.has_traffic_light and not self.config.phases:
+        if self.config.has_traffic_light and not getattr(self.config, 'phases', None):
             self._init_traffic_light_phases()
 
         # 设置边订阅
@@ -721,13 +721,8 @@ class JunctionAgent:
                 try:
                     veh_ids = traci.edge.getLastStepVehicleIDs(edge_id)
                 except Exception as e:
-                    if step % 100 == 0 and step > 0:
-                        print(f"获取边 {edge_id} 车辆ID列表失败: {e}")
                     continue
 
-            # 调试：每100步打印一次
-            if step % 100 == 0 and step > 0 and len(veh_ids) > 0:
-                print(f"[{self.junction_id}] 边 {edge_id}: {len(veh_ids)} 辆车")
 
             # 3. 获取车辆详细订阅数据
             for veh_id in veh_ids:
@@ -833,23 +828,86 @@ class JunctionAgent:
         return mean_speed * total_vehicles
     
     def _compute_conflict_risk(self, state: JunctionState) -> float:
-        """计算冲突风险"""
+        """计算冲突风险（使用车道级冲突矩阵）"""
         if not state.main_vehicles or not state.ramp_vehicles:
             return 0.0
-        
+
+        # 导入车道冲突矩阵
+        try:
+            from road_topology_hardcoded import LANE_CONFLICTS
+        except ImportError:
+            # 如果导入失败，使用默认冲突矩阵（关键路口）
+            LANE_CONFLICTS = {
+                # J5: E23匝道汇入-E2
+                'E23_0': ['-E2_0', '-E2_1'],
+                # J14: E15匝道汇入-E9
+                'E15_0': ['-E10_0', '-E10_1'],
+                # J15: E17匝道汇入-E10
+                'E17_0': ['-E11_0', '-E11_1'],
+                # J17: E19匝道汇入-E12
+                'E19_0': ['-E13_0', '-E13_1'],
+                'E19_1': ['-E13_0'],
+            }
+            print("[警告] 使用默认车道冲突矩阵（可能不完全准确）")
+
+        # 基础密度风险
+        main_density = len(state.main_vehicles) / max(len(self.config.main_incoming), 1)
+        ramp_density = len(state.ramp_vehicles) / max(len(self.config.ramp_incoming), 1)
+
+        # 速度差风险
+        speed_diff = abs(state.main_speed - state.ramp_speed)
+
+        # 信号灯影响
         signal_factor = 1.0
         if state.ramp_signal == 'G':
             signal_factor = 0.3
         elif state.ramp_signal == 'r':
             signal_factor = 0.1
-        
-        main_density = len(state.main_vehicles) / max(len(self.config.main_incoming), 1)
-        ramp_density = len(state.ramp_vehicles) / max(len(self.config.ramp_incoming), 1)
-        
-        speed_diff = abs(state.main_speed - state.ramp_speed)
-        
-        risk = (main_density * ramp_density) * (speed_diff / 20.0) * signal_factor
-        
+
+        # 车道冲突风险计算
+        lane_conflict_risk = 0.0
+        if LANE_CONFLICTS:
+            # 获取该路口配置的车道冲突信息
+            junction_config = LANE_CONFLICTS
+
+            # 检查匝道车辆与主路车辆的车道冲突
+            for ramp_veh in state.ramp_vehicles:
+                # 构建车道ID（格式：edge_lane）
+                edge_id = ramp_veh.get('edge', '')
+                lane_idx = ramp_veh.get('lane', 0)
+                ramp_lane_id = f"{edge_id}_{lane_idx}"
+
+                # 获取该匝道车道的冲突车道列表
+                conflict_lanes = junction_config.get(ramp_lane_id, [])
+
+                # 检查主路车辆是否在冲突车道上
+                for main_veh in state.main_vehicles:
+                    main_edge = main_veh.get('edge', '')
+                    main_lane_idx = main_veh.get('lane', 0)
+                    main_lane_id = f"{main_edge}_{main_lane_idx}"
+
+                    if main_lane_id in conflict_lanes:
+                        # 存在车道冲突，增加风险
+                        lane_conflict_risk += 0.15
+
+                        # 如果速度差异大，增加额外风险
+                        veh_speed_diff = abs(ramp_veh.get('speed', 0) - main_veh.get('speed', 0))
+                        if veh_speed_diff > 5.0:  # 速度差超过5m/s
+                            lane_conflict_risk += 0.10
+
+            # 归一化车道冲突风险
+            max_possible_conflicts = len(state.ramp_vehicles) * len(state.main_vehicles)
+            if max_possible_conflicts > 0:
+                lane_conflict_risk = min(lane_conflict_risk / max_possible_conflicts * 5.0, 1.0)
+
+        # 综合风险计算（加权组合）
+        risk = (
+            main_density * ramp_density * 0.25 +           # 密度风险
+            (speed_diff / 20.0) * 0.25 +                    # 速度差风险
+            min(lane_conflict_risk, 1.0) * 0.35 +           # 车道冲突风险
+            (1.0 - signal_factor) * 0.15                    # 信号灯风险
+        )
+
         return min(risk, 1.0)
     
     def _compute_gap_acceptance(self, state: JunctionState) -> float:
@@ -881,41 +939,46 @@ class JunctionAgent:
             return np.zeros(self.get_state_dim())
         
         features = [
-            len(state.main_vehicles) / 20.0,
-            state.main_speed / 20.0,
-            state.main_density / 50.0,
-            state.main_queue_length / 20.0,
-            state.main_flow / 1000.0,
-            
-            len(state.ramp_vehicles) / 10.0,
-            state.ramp_speed / 20.0,
-            state.ramp_queue_length / 10.0,
-            state.ramp_waiting_time / 60.0,
-            state.ramp_flow / 500.0,
-            
+            # 主路状态（基于3600步实际数据，向上取整到整十数）
+            len(state.main_vehicles) / 10.0,     # 99分位数7.0 → 取整10
+            state.main_speed / 20.0,              # 99分位数15.5 m/s → 取整20
+            state.main_density / 10.0,            # 99分位数7.0 → 取整10
+            state.main_queue_length / 10.0,       # 最大值2 → 取整10
+            state.main_flow / 100.0,              # 99分位数85.1 → 取整100
+
+            # 匝道状态（基于3600步实际数据，向上取整到整十数）
+            len(state.ramp_vehicles) / 40.0,      # 99分位数32 → 取整40
+            state.ramp_speed / 10.0,              # 99分位数5.2 m/s → 取整10
+            state.ramp_queue_length / 40.0,       # 99分位数32 → 取整40
+            state.ramp_waiting_time / 80.0,       # 99分位数72.4s → 取整80
+            state.ramp_flow / 80.0,               # 99分位数67.9 → 取整80
+
+            # 信号灯状态
             state.current_phase / max(self.config.num_phases, 1),
-            state.time_to_switch / 100.0,
+            state.time_to_switch / 10.0,          # 最大值0 → 取整10（保留余地）
             float(state.main_signal == 'G'),
             float(state.ramp_signal == 'G'),
             float(state.diverge_signal == 'G') if self.junction_type == JunctionType.TYPE_B else 0.0,
-            
+
+            # 风险和间隙（已归一化）
             state.conflict_risk,
             state.gap_acceptance,
-            
+
+            # CV比例（已归一化）
             len(state.cv_vehicles_main) / max(len(state.main_vehicles), 1),
             len(state.cv_vehicles_ramp) / max(len(state.ramp_vehicles), 1),
         ]
         
         if self.junction_type == JunctionType.TYPE_B:
             features.extend([
-                len(state.diverge_vehicles) / 10.0,
-                state.diverge_queue_length / 10.0,
+                len(state.diverge_vehicles) / 10.0,     # 最大值0 → 取整10（保留余地）
+                state.diverge_queue_length / 10.0,      # 最大值0 → 取整10（保留余地）
                 len(state.cv_vehicles_diverge) / max(len(state.diverge_vehicles), 1),
             ])
         else:
             features.extend([0.0, 0.0, 0.0])
-        
-        features.append(state.timestamp / 3600.0)
+
+        features.append(state.timestamp / 3600.0)      # 最大值3600 → 保持3600
         
         return np.array(features, dtype=np.float32)
     

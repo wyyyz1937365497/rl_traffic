@@ -164,6 +164,10 @@ class JunctionConfig:
     reverse_incoming: List[str] = field(default_factory=list)  # 反向主路上游（与匝道冲突的方向）
     reverse_outgoing: List[str] = field(default_factory=list)  # 反向主路下游（匝道汇入边）
 
+    # 所有相关边和车道
+    all_edges: List[str] = field(default_factory=list)
+    all_lanes: List[str] = field(default_factory=list)
+
     # 车道级冲突信息（新增）
     num_main_lanes: int = 0        # 主路车道数
     num_ramp_lanes: int = 0        # 匝道车道数
@@ -173,6 +177,15 @@ class JunctionConfig:
     has_traffic_light: bool = False
     tl_id: str = ""
     num_phases: int = 2
+    phases: List = field(default_factory=list)  # 信号灯相位列表
+
+    def __post_init__(self):
+        """初始化所有边和车道"""
+        self.all_edges = (
+            self.main_incoming + self.main_outgoing +
+            self.ramp_incoming + self.ramp_outgoing +
+            self.reverse_incoming + self.reverse_outgoing
+        )
 
 
 # 更新路口配置，包含控制区域和车道级冲突信息
