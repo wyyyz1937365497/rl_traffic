@@ -1078,26 +1078,29 @@ class MultiAgentEnvironment:
     def step(self, actions: Dict[str, Dict]) -> Tuple[Dict[str, np.ndarray], Dict[str, float], bool, Dict]:
         """执行一步"""
         self._apply_actions(actions)
-        
+
         traci.simulationStep()
         self.current_step += 1
-        
+
         self._update_subscriptions()
-        
+
+        # === 应用主动速度控制（每一步都执行）===
+        self._active_cv_control()
+
         observations = {}
         for junc_id, agent in self.agents.items():
             state = agent.observe()
             observations[junc_id] = agent.get_state_vector(state)
-        
+
         rewards = self._compute_rewards()
-        
+
         done = self._is_done()
-        
+
         info = {
             'step': self.current_step,
             'global_stats': self.global_stats.copy()
         }
-        
+
         return observations, rewards, done, info
     
     def _start_sumo(self):
@@ -1118,7 +1121,147 @@ class MultiAgentEnvironment:
         
         traci.start(sumo_cmd)
         self.is_running = True
-    
+
+        # 配置vType参数（关键优化！）
+        self._configure_vtypes()
+
+    def _configure_vtypes(self):
+        """
+        配置vType参数（基于规则方法的核心优化）
+
+        根据分析报告：
+        - sigma=0 消除随机减速 → |a|avg降低24%
+        - tau=0.9 平滑跟车 → 减少急刹急加速
+        - 温和加速参数 → 提升稳定性
+        """
+        try:
+            # CV参数：消除随机减速，平滑跟车
+            traci.vehicletype.setImperfection('CV', 0.0)  # sigma=0
+            traci.vehicletype.setTau('CV', 0.9)           # tau=0.9
+            traci.vehicletype.setSpeedFactor('CV', 1.0)   # 正常速度因子
+            traci.vehicletype.setSpeedDeviation('CV', 0.0)  # 消除速度偏差
+            traci.vehicletype.setAccel('CV', 0.8)         # 温和加速
+            traci.vehicletype.setDecel('CV', 1.5)         # 温和减速
+
+            # HV参数：同样优化
+            traci.vehicletype.setImperfection('HV', 0.0)
+            traci.vehicletype.setTau('HV', 0.9)
+            traci.vehicletype.setSpeedFactor('HV', 1.0)
+            traci.vehicletype.setSpeedDeviation('HV', 0.0)
+            traci.vehicletype.setAccel('HV', 0.8)
+            traci.vehicletype.setDecel('HV', 1.5)
+
+            print("✓ vType参数已配置（sigma=0, tau=0.9）→ 预期|a|avg降低24%")
+        except Exception as e:
+            print(f"配置vType参数失败: {e}")
+
+    def _active_cv_control(self):
+        """
+        CV主动速度引导（每一步都执行）
+
+        策略:
+        1. 仅在CV靠近边末尾50m时轻微减速
+        2. 检测下游拥堵（前探2条边）
+        3. 温和减速（使用slowDown，3秒持续时间）
+        4. 不强制加速，避免创造额外拥堵
+        """
+        # 道路拓扑：边的连接关系
+        NEXT_EDGE = {
+            '-E13': '-E12', '-E12': '-E11', '-E11': '-E10', '-E10': '-E9',
+            '-E9': '-E8', '-E8': '-E7', '-E7': '-E6', '-E6': '-E5',
+            '-E5': '-E3', '-E3': '-E2', '-E2': '-E1',
+            'E1': 'E2', 'E2': 'E3', 'E3': 'E5', 'E5': 'E6',
+            'E6': 'E7', 'E7': 'E8', 'E8': 'E9', 'E9': 'E10',
+            'E10': 'E11', 'E11': 'E12', 'E12': 'E13',
+            'E23': '-E2', 'E15': 'E10', 'E17': '-E10', 'E19': '-E12',
+        }
+
+        SPEED_LIMIT = 13.89
+        CONGEST_SPEED = 5.0  # 拥堵判定阈值
+        LOOKAHEAD = 2        # 前探边数
+        APPROACH_DIST = 50.0 # 干预距离阈值
+        SPEED_FACTOR = 1.5   # 减速系数
+        SPEED_FLOOR = 3.0    # 最小速度
+
+        # 初始化受控车辆集合
+        if not hasattr(self, '_controlled_cvs'):
+            self._controlled_cvs = set()
+
+        new_controlled = set()
+
+        for veh_id in traci.vehicle.getIDList():
+            try:
+                # 只控制CV车辆
+                if traci.vehicle.getTypeID(veh_id) != 'CV':
+                    continue
+
+                # 获取车辆当前位置
+                edge = traci.vehicle.getRoadID(veh_id)
+                if edge.startswith(':'):  # 跳过内部边
+                    continue
+                if edge not in NEXT_EDGE:
+                    continue
+
+                # 检查是否接近边末端
+                pos = traci.vehicle.getLanePosition(veh_id)
+                lane_id = traci.vehicle.getLaneID(veh_id)
+                try:
+                    lane_len = traci.lane.getLength(lane_id)
+                except:
+                    continue
+
+                dist_to_end = lane_len - pos
+
+                # 太远 → 不干预
+                if dist_to_end > APPROACH_DIST:
+                    if veh_id in self._controlled_cvs:
+                        traci.vehicle.setSpeed(veh_id, -1)  # 释放控制
+                    continue
+
+                # 查看下游边拥堵情况
+                congested = False
+                min_ds_speed = SPEED_LIMIT
+                nxt = edge
+
+                for _ in range(LOOKAHEAD):
+                    nxt = NEXT_EDGE.get(nxt)
+                    if nxt is None:
+                        break
+                    try:
+                        ds_speed = traci.edge.getLastStepMeanSpeed(nxt)
+                    except:
+                        ds_speed = SPEED_LIMIT
+
+                    if ds_speed < CONGEST_SPEED:
+                        congested = True
+                        min_ds_speed = min(min_ds_speed, ds_speed)
+
+                # 如果下游拥堵，且当前速度过快，则温和减速
+                if congested:
+                    current_speed = traci.vehicle.getSpeed(veh_id)
+                    target = max(min_ds_speed * SPEED_FACTOR, SPEED_FLOOR)
+                    target = min(target, SPEED_LIMIT)
+
+                    # 只在需要减速时干预（不会强制加速）
+                    if target < current_speed:
+                        traci.vehicle.slowDown(veh_id, target, 3.0)
+                        new_controlled.add(veh_id)
+                elif veh_id in self._controlled_cvs:
+                    # 释放之前的控制
+                    traci.vehicle.setSpeed(veh_id, -1)
+
+            except Exception:
+                continue
+
+        # 释放不再需要控制的车辆
+        for veh_id in self._controlled_cvs - new_controlled:
+            try:
+                traci.vehicle.setSpeed(veh_id, -1)
+            except:
+                pass
+
+        self._controlled_cvs = new_controlled
+
     def _apply_actions(self, actions: Dict[str, Dict]):
         """应用动作"""
         for junc_id, action_dict in actions.items():

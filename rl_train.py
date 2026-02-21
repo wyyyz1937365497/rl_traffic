@@ -68,7 +68,7 @@ def check_environment():
             if 'microsoft' in f.read().lower():
                 print("  ✓ WSL 环境")
 
-    print(f"\n推荐配置: --num-envs {min(4, cpu_count)}")
+    print(f"\n推荐配置: --workers {min(8, cpu_count)}")
 
 
 def start_async_evaluation(model_path, sumo_cfg, iteration, eval_dir='evaluations', device='cuda'):
@@ -206,8 +206,7 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 traci_wrapper.simulationStep()
                 self.current_step += 1
 
-                # ========== 关键修复：更新订阅结果 ==========
-                # 必须在 observe() 之前调用，否则订阅数据为空
+                # ========== 更新订阅结果 ==========
                 self.sub_manager.update_results()
 
                 # 为新车辆设置订阅
@@ -218,6 +217,9 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
 
                 # 清理已离开的车辆
                 self.sub_manager.cleanup_left_vehicles(current_vehicles)
+
+                # === 应用主动速度控制（每一步都执行）===
+                self._active_cv_control()
 
                 # 观察新状态（订阅模式优化）
                 obs_start = time.time()
@@ -270,6 +272,9 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 # 2. 直接设置订阅模式模块的traci属性（因为模块级别引用已固定）
                 junction_agent.traci = traci_wrapper
                 self.logger.debug("已设置traci连接（订阅模式兼容）")
+
+                # 配置vType参数（关键优化！）
+                self._configure_vtypes()
 
             except Exception as e:
                 self.logger.error(f"启动SUMO失败: {e}\n{tb.format_exc()}")
@@ -425,6 +430,129 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 self.logger.debug(f"计算OCR失败: {e}")
                 return 0.0
 
+        def _configure_vtypes(self):
+            """配置vType参数（基于规则方法的核心优化）"""
+            import os
+
+            # 从环境变量读取参数（与评测脚本一致）
+            sigma = float(os.environ.get('CTRL_SIGMA', '0.0'))
+            tau = float(os.environ.get('CTRL_TAU', '0.9'))
+            accel = os.environ.get('CTRL_ACCEL', '0.8')
+            decel = os.environ.get('CTRL_DECEL', '1.5')
+
+            try:
+                # CV参数：消除随机减速，平滑跟车
+                traci_wrapper.vehicletype.setImperfection('CV', sigma)
+                traci_wrapper.vehicletype.setTau('CV', tau)
+                traci_wrapper.vehicletype.setAccel('CV', float(accel))
+                traci_wrapper.vehicletype.setDecel('CV', float(decel))
+
+                # HV参数：同样优化
+                traci_wrapper.vehicletype.setImperfection('HV', sigma)
+                traci_wrapper.vehicletype.setTau('HV', tau)
+                traci_wrapper.vehicletype.setAccel('HV', float(accel))
+                traci_wrapper.vehicletype.setDecel('HV', float(decel))
+
+                self.logger.info(f"vType配置: sigma={sigma}, tau={tau}, accel={accel}, decel={decel}")
+            except Exception as e:
+                self.logger.warning(f"vType配置失败: {e}")
+
+        def _active_cv_control(self):
+            """CV主动速度引导（每一步都执行）"""
+            import os
+
+            # 检查是否启用主动控制
+            active = int(os.environ.get('CTRL_ACTIVE', '1'))
+            if active < 1:
+                return
+
+            # 控制参数
+            approach_dist = float(os.environ.get('CTRL_APPROACH_DIST', '50.0'))
+            congest_speed = float(os.environ.get('CTRL_CONGEST_SPEED', '5.0'))
+            speed_factor = float(os.environ.get('CTRL_SPEED_FACTOR', '1.5'))
+            speed_floor = float(os.environ.get('CTRL_SPEED_FLOOR', '3.0'))
+            lookahead = int(os.environ.get('CTRL_LOOKAHEAD', '2'))
+
+            # 道路拓扑（下游边映射）
+            NEXT_EDGE = {
+                'E1': 'E2', 'E2': 'E3', 'E3': 'E4', 'E4': 'E5',
+                'E5': 'E6', 'E6': 'E7', 'E7': 'E8', 'E8': 'E9',
+                'E9': 'E10', 'E10': 'E11', 'E11': 'E12', 'E12': 'E13',
+                'E13': 'E14', 'E14': 'E15', 'E15': 'E16', 'E16': 'E17',
+                'E17': 'E18', 'E18': 'E19', 'E19': 'E20', 'E20': 'E21',
+                'E21': 'E22', 'E22': 'E23', 'E23': 'E24'
+            }
+
+            try:
+                for veh_id in traci_wrapper.vehicle.getIDList():
+                    # 只控制CV车辆
+                    if traci_wrapper.vehicle.getTypeID(veh_id) != 'CV':
+                        continue
+
+                    try:
+                        # 获取当前位置
+                        road_id = traci_wrapper.vehicle.getRoadID(veh_id)
+                        lane_id = traci_wrapper.vehicle.getLaneID(veh_id)
+                        lane_pos = traci_wrapper.vehicle.getLanePosition(veh_id)
+
+                        # 车换不在主路上，跳过
+                        if road_id not in NEXT_EDGE:
+                            continue
+
+                        # 检查是否接近边末尾
+                        lane_len = 0
+                        try:
+                            lane_len = traci_wrapper.lane.getLength(lane_id)
+                        except:
+                            try:
+                                edge_len = traci_wrapper.edge.getLength(road_id)
+                                lane_len = edge_len
+                            except:
+                                continue
+
+                        dist_to_end = lane_len - lane_pos
+                        if dist_to_end > approach_dist:
+                            continue
+
+                        # 检测下游拥堵
+                        congested = False
+                        min_ds_speed = 100.0
+                        current_edge = road_id
+
+                        for _ in range(lookahead):
+                            if current_edge not in NEXT_EDGE:
+                                break
+                            next_edge = NEXT_EDGE[current_edge]
+
+                            try:
+                                ds_speed = traci_wrapper.edge.getLastStepMeanSpeed(next_edge)
+                                min_ds_speed = min(min_ds_speed, ds_speed)
+
+                                if ds_speed < congest_speed:
+                                    congested = True
+                                    break
+                            except:
+                                break
+
+                            current_edge = next_edge
+
+                        # 如果下游拥堵且当前速度过快，温和减速
+                        if congested:
+                            current_speed = traci_wrapper.vehicle.getSpeed(veh_id)
+                            target_speed = max(min_ds_speed * speed_factor, speed_floor)
+
+                            if current_speed > target_speed:
+                                # 使用slowDown温和减速（3秒持续时间）
+                                traci_wrapper.vehicle.slowDown(veh_id, target_speed, 3.0)
+
+                    except Exception as e:
+                        # 单辆车控制失败不影响其他车辆
+                        continue
+
+            except Exception as e:
+                # 整体控制失败只记录，不中断
+                self.logger.debug(f"主动控制失败: {e}")
+
         def close(self):
             """关闭环境"""
             if self.is_running:
@@ -459,8 +587,21 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
         np.random.seed(seed + worker_id)
         torch.manual_seed(seed + worker_id)
 
-        device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
-        worker_logger.info(f"使用设备: {device}")
+        # 根据worker_id分配GPU（支持双GPU）
+        if use_cuda and torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            if gpu_count >= 2:
+                # 将workers均匀分配到两张GPU
+                # 例如8个workers: 0,1,2,3 → cuda:0 | 4,5,6,7 → cuda:1
+                device_id = worker_id % gpu_count
+                device = f'cuda:{device_id}'
+                worker_logger.info(f"使用设备: {device} (Worker {worker_id} → GPU {device_id})")
+            else:
+                device = 'cuda'
+                worker_logger.info(f"使用设备: {device} (单GPU模式)")
+        else:
+            device = 'cpu'
+            worker_logger.info(f"使用设备: {device}")
 
         # 创建环境
         env = create_libsumo_environment(sumo_cfg, seed)
@@ -580,13 +721,21 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
             if done:
                 break
 
+        episode_time = time.time() - episode_start
+        worker_logger.info(f"Worker {worker_id} 完成，收集 {len(experiences)} 步经验，耗时 {episode_time:.1f}秒")
+
+        # 计算最终OCR（在关闭环境之前！）
+        try:
+            final_ocr = env._compute_current_ocr()
+            worker_logger.info(f"最终OCR: {final_ocr:.4f}")
+        except Exception as e:
+            worker_logger.warning(f"计算OCR失败: {e}")
+            final_ocr = 0.0
+
         try:
             env.close()
         except Exception as e:
             worker_logger.warning(f"关闭环境时出错: {e}")
-
-        episode_time = time.time() - episode_start
-        worker_logger.info(f"Worker {worker_id} 完成，收集 {len(experiences)} 步经验，耗时 {episode_time:.1f}秒")
 
         # 保存到文件
         output_file = os.path.join(output_dir, f'worker_{worker_id}.pkl')
@@ -594,7 +743,8 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
             'worker_id': worker_id,
             'experiences': experiences,
             'total_rewards': total_rewards,
-            'steps': len(experiences)
+            'steps': len(experiences),
+            'ocr': final_ocr  # 添加OCR到结果中
         }
 
         try:
@@ -625,7 +775,7 @@ def _get_vehicle_features(vehicle_ids, device):
     if not vehicle_ids:
         return None
 
-    MAX_VEHICLES = 300  # 最大车辆数
+    MAX_VEHICLES = 350  # 最大车辆数
     features = []
     for veh_id in vehicle_ids[:MAX_VEHICLES]:
         try:
@@ -685,7 +835,6 @@ def train(args):
         ppo_config.batch_size = args.batch_size
 
     num_workers = args.workers or multiprocessing.cpu_count()
-    num_envs = min(args.num_envs, num_workers)
 
     print(f"\n训练配置:")
     print(f"  SUMO配置: {args.sumo_cfg}")
@@ -693,8 +842,33 @@ def train(args):
     print(f"  学习率: {ppo_config.lr}")
     print(f"  批大小: {ppo_config.batch_size}")
     print(f"  设备: {'cuda' if torch.cuda.is_available() else 'cpu'}")
-    print(f"  并行环境: {num_envs}")
-    print(f"  工作进程: {num_workers}")
+
+    # 显示GPU分配信息
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        print(f"  GPU数量: {gpu_count}")
+        if gpu_count >= 2 and num_workers > 1:
+            workers_per_gpu = num_workers // gpu_count
+            print(f"  Worker分配:")
+            for i in range(gpu_count):
+                start_worker = i * workers_per_gpu
+                end_worker = (i + 1) * workers_per_gpu if i < gpu_count - 1 else num_workers
+                worker_range = f"{start_worker}-{end_worker-1}" if end_worker - start_worker > 1 else str(start_worker)
+                print(f"    cuda:{i}: Workers [{worker_range}] ({end_worker - start_worker}个)")
+
+    print(f"  并行环境数 (Worker进程): {num_workers}")
+
+    # 创建时间戳子目录
+    from datetime import datetime
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    save_dir = os.path.join(args.save_dir, f'train_{timestamp}')
+    log_dir = os.path.join(args.log_dir, f'train_{timestamp}')
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    print(f"\n输出目录:")
+    print(f"  模型保存: {save_dir}")
+    print(f"  日志保存: {log_dir}")
 
     # 创建模型
     model = create_junction_model(JUNCTION_CONFIGS, net_config)
@@ -710,7 +884,7 @@ def train(args):
 
     # TensorBoard
     from torch.utils.tensorboard import SummaryWriter
-    writer = SummaryWriter(args.log_dir)
+    writer = SummaryWriter(log_dir)
 
     # 临时目录
     temp_dir = os.path.join(os.getcwd(), 'tmp')
@@ -724,6 +898,7 @@ def train(args):
     timesteps = 0
     best_ocr = 0.0
     entropy_coef = ppo_config.entropy_coef
+    iteration_ocr_history = []  # 跟踪每次迭代的OCR
 
     print(f"\n开始训练...")
     print(f"预计迭代次数: {num_iterations}")
@@ -770,6 +945,7 @@ def train(args):
             total_rewards = {}
             total_steps = 0
             worker_stats = []
+            worker_ocrs = []  # 收集所有worker的OCR
 
             for worker_id in tqdm(range(num_workers), desc="  收集数据", leave=False, ncols=100):
                 result_file = os.path.join(temp_dir, f'worker_{worker_id}.pkl')
@@ -787,7 +963,9 @@ def train(args):
                             result_data = pickle.load(f)
 
                         exp_count = len(result_data.get('experiences', []))
-                        tqdm.write(f"  📦 Worker {worker_id}: 读取 {exp_count} 条经验")
+                        ocr = result_data.get('ocr', 0.0)
+                        worker_ocrs.append(ocr)
+                        tqdm.write(f"  📦 Worker {worker_id}: OCR={ocr:.4f}, 读取 {exp_count} 条经验")
 
                         added_count = 0
                         for exp in result_data['experiences']:
@@ -873,6 +1051,14 @@ def train(args):
             writer.add_scalar('train/update_time', update_time, timesteps)
             writer.add_scalar('train/entropy_coef', entropy_coef, timesteps)
 
+            # 记录OCR到TensorBoard
+            if worker_ocrs:
+                mean_ocr = np.mean(worker_ocrs)
+                writer.add_scalar('train/ocr', mean_ocr, timesteps)
+                # 记录预估得分
+                estimated_score = max(0, (mean_ocr - 0.8812) / 0.8812 * 100)
+                writer.add_scalar('train/estimated_score', estimated_score, timesteps)
+
             # ========== 模型更新完成日志 ==========
             tqdm.write(f"\n{'='*70}")
             tqdm.write(f"🔄 模型更新完成 - 迭代 {iteration + 1}/{num_iterations}")
@@ -887,6 +1073,16 @@ def train(args):
             tqdm.write(f"  - 模型更新: {update_time:.1f}秒")
             tqdm.write(f"  - 总耗时: {collect_time + update_time:.1f}秒")
             tqdm.write(f"\n🎯 性能指标:")
+
+            # OCR统计
+            if worker_ocrs:
+                mean_ocr = np.mean(worker_ocrs)
+                std_ocr = np.std(worker_ocrs)
+                min_ocr = np.min(worker_ocrs)
+                max_ocr = np.max(worker_ocrs)
+                tqdm.write(f"  - 平均OCR: {mean_ocr:.4f} ± {std_ocr:.4f} (范围: {min_ocr:.4f} - {max_ocr:.4f})")
+                tqdm.write(f"  - 得分预估: {(mean_ocr - 0.8812) / 0.8812 * 100:.2f} (基准OCR=0.8812)")
+
             tqdm.write(f"  - 平均奖励: {mean_reward_before:.4f}")  # 使用训练前计算的奖励
             tqdm.write(f"  - 损失: {update_result['loss']:.4f}")
             tqdm.write(f"  - 熵系数: {entropy_coef:.6f}")
@@ -896,20 +1092,31 @@ def train(args):
             tqdm.write(f"{'='*70}\n")
 
             # 更新进度条后缀
-            pbar.set_postfix({
+            postfix_dict = {
                 'steps': f'{timesteps:,}',
                 'reward': f'{mean_reward:.2f}',
                 'loss': f'{update_result["loss"]:.4f}',
                 'col_t': f'{collect_time:.1f}s',
                 'upd_t': f'{update_time:.1f}s'
-            })
+            }
+            # 添加OCR到进度条
+            if worker_ocrs:
+                mean_ocr = np.mean(worker_ocrs)
+                postfix_dict['ocr'] = f'{mean_ocr:.4f}'
+
+                # 更新最佳OCR
+                if mean_ocr > best_ocr:
+                    best_ocr = mean_ocr
+                    tqdm.write(f"🏆 新的最佳OCR: {best_ocr:.4f} (预估得分: {(best_ocr - 0.8812) / 0.8812 * 100:.2f})")
+
+                iteration_ocr_history.append(mean_ocr)
+
+            pbar.set_postfix(postfix_dict)
 
             # ========== 保存检查点并启动异步评估 ==========
             # 每5次迭代保存一次检查点
             if (iteration + 1) % 5 == 0:
-                # 确保保存目录存在
-                os.makedirs(args.save_dir, exist_ok=True)
-                checkpoint_path = os.path.join(args.save_dir, f'checkpoint_iter_{iteration+1:04d}.pt')
+                checkpoint_path = os.path.join(save_dir, f'checkpoint_iter_{iteration+1:04d}.pt')
                 torch.save(model.state_dict(), checkpoint_path)
                 tqdm.write(f"💾 检查点已保存: {checkpoint_path}\n")
 
@@ -919,7 +1126,7 @@ def train(args):
                     model_path=checkpoint_path,
                     sumo_cfg=args.sumo_cfg,
                     iteration=iteration + 1,
-                    eval_dir=os.path.join(args.save_dir, 'evaluations'),
+                    eval_dir=os.path.join(save_dir, 'evaluations'),
                     device=device
                 )
                 tqdm.write(f"✅ 评估进程已启动（迭代 {iteration + 1}）\n")
@@ -933,6 +1140,28 @@ def train(args):
         # 关闭进度条
         pbar.close()
 
+        # 训练完成总结
+        print_header("训练完成")
+        print(f"总训练步数: {timesteps:,}")
+        print(f"总迭代次数: {iteration + 1}")
+
+        if iteration_ocr_history:
+            print(f"\nOCR统计:")
+            print(f"  初始OCR: {iteration_ocr_history[0]:.4f}")
+            print(f"  最终OCR: {iteration_ocr_history[-1]:.4f}")
+            print(f"  最佳OCR: {best_ocr:.4f}")
+            print(f"  平均OCR: {np.mean(iteration_ocr_history):.4f} ± {np.std(iteration_ocr_history):.4f}")
+            print(f"\n得分预估 (基准OCR=0.8812):")
+            print(f"  初始得分: {(iteration_ocr_history[0] - 0.8812) / 0.8812 * 100:.2f}")
+            print(f"  最终得分: {(iteration_ocr_history[-1] - 0.8812) / 0.8812 * 100:.2f}")
+            print(f"  最佳得分: {(best_ocr - 0.8812) / 0.8812 * 100:.2f}")
+
+            # OCR改进
+            ocr_improvement = (iteration_ocr_history[-1] - iteration_ocr_history[0]) / iteration_ocr_history[0] * 100
+            print(f"\nOCR改进: {ocr_improvement:+.2f}%")
+
+        print("=" * 70)
+
     finally:
         # 清理临时文件
         for f in os.listdir(temp_dir):
@@ -942,10 +1171,11 @@ def train(args):
                 print(f"删除临时文件 {f} 失败: {e}")
         writer.close()
 
-    # 保存模型
-    os.makedirs(args.save_dir, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(args.save_dir, 'final_model.pt'))
-    print(f"\n模型已保存: {args.save_dir}/final_model.pt")
+    # 保存最终模型
+    final_model_path = os.path.join(save_dir, 'final_model.pt')
+    torch.save(model.state_dict(), final_model_path)
+    print(f"\n模型已保存: {final_model_path}")
+    print(f"所有训练文件保存在: {save_dir}")
 
 
 def main():
@@ -955,8 +1185,7 @@ def main():
     parser.add_argument('--total-timesteps', type=int, default=1000000, help='总训练步数')
     parser.add_argument('--lr', type=float, default=3e-4, help='学习率')
     parser.add_argument('--batch-size', type=int, default=4096, help='批大小')
-    parser.add_argument('--num-envs', type=int, default=4, help='并行环境数量')
-    parser.add_argument('--workers', type=int, help='工作进程数（默认=CPU核心数）')
+    parser.add_argument('--workers', type=int, help='工作进程数（默认=CPU核心数，每个进程=1个并行环境）')
     parser.add_argument('--update-frequency', type=int, default=2048, help='更新频率')
     parser.add_argument('--save-dir', type=str, default='checkpoints', help='保存目录')
     parser.add_argument('--log-dir', type=str, default='logs', help='日志目录')

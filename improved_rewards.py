@@ -1,6 +1,6 @@
 """
-改进版奖励函数 - 基于评分公式
-硬编码基准OCR并使用初赛评分公式作为奖励
+改进版奖励函数 - 包含正向奖励
+解决"只有惩罚没有奖励"的问题
 """
 
 import numpy as np
@@ -11,12 +11,9 @@ from collections import defaultdict
 class ImprovedRewardCalculator:
     """
     改进的奖励计算器
-    基于初赛评分公式计算奖励
+    包含正向奖励和负向惩罚
     """
-
-    # 硬编码基准OCR (从评测结果反推)
-    BASELINE_OCR = 0.8812
-
+    
     def __init__(self):
         # 历史状态追踪
         self.previous_ocr = defaultdict(float)
@@ -26,24 +23,27 @@ class ImprovedRewardCalculator:
 
         # ===== 重新设计：专注于实时可观测指标的奖励权重 =====
         self.weights = {
-            # ===== 正向奖励（大幅增加，强化积极行为）=====
-            'vehicle_departure': 1.0,        # 车辆离开奖励（从0.3增加到1.0）
-            'flow_maintenance': 3.0,         # 流量保持奖励（从1.0增加到3.0）
-            'speed_maintenance': 1.5,        # 速度维持奖励（从0.5增加到1.5）
-            'gap_utilization': 3.0,          # 间隙利用奖励（从1.5增加到3.0）
-            'no_stops': 1.0,                 # 无停车奖励（从0.3增加到1.0）
-            'capacity_bonus': 2.0,           # 通行能力奖励（从1.0增加到2.0）
+            # ===== 正向奖励（实时有效）=====
+            'vehicle_departure': 0.3,        # 车辆离开奖励（每辆离开控制区）
+            'flow_maintenance': 1.0,         # 流量保持奖励（主路和匝道都有流动）
+            'speed_maintenance': 0.5,        # 速度维持奖励（保持较高速度）
+            'gap_utilization': 1.5,          # 间隙利用奖励（匝道车辆成功利用间隙）
+            'no_stops': 0.3,                 # 无停车奖励（车辆不停车）
+            'capacity_bonus': 1.0,           # 通行能力奖励（多车辆同时通过）
 
             # ===== 期末奖励（episode结束时）=====
             'ocr_final': 100.0,              # 最终OCR奖励（episode结束时一次性）
             'throughput_bonus': 5.0,         # 总通过量奖励
 
-            # ===== 负向惩罚（进一步减小，避免累积效应）=====
-            'queue_penalty': 0.002,          # 排队惩罚（从0.005减少到0.002）
-            'waiting_penalty': 0.001,        # 等待惩罚（从0.002减少到0.001）
-            'conflict_penalty': 0.01,        # 冲突惩罚（从0.02减少到0.01）
-            'speed_variance': 0.0005,        # 速度方差惩罚（从0.001减少到0.0005）
+            # ===== 负向惩罚（保持较小权重）=====
+            'queue_penalty': 0.005,          # 排队惩罚
+            'waiting_penalty': 0.002,        # 等待惩罚
+            'conflict_penalty': 0.02,        # 冲突惩罚
+            'speed_variance': 0.001,         # 速度方差惩罚
         }
+
+        # 奖励裁剪范围（移除裁剪）
+        # self.reward_clip_range = (-10.0, 10.0)  # 已移除：让奖励自然分布
 
         # Episode追踪
         self.episode_throughput = defaultdict(int)  # 累计通过量
@@ -95,28 +95,12 @@ class ImprovedRewardCalculator:
             elif main_flow or ramp_flow:
                 flow_reward = self.weights['flow_maintenance'] * 0.5
 
-            # 3. 速度维持奖励（更细致的分层）
+            # 3. 速度维持奖励
             speed_reward = 0.0
-
-            # 主路速度奖励：4层精细分级
-            if state.main_speed > 12.0:  # 43.2km/h - 优秀
-                speed_reward += self.weights['speed_maintenance'] * 1.2
-            elif state.main_speed > 10.0:  # 36km/h - 良好
+            if state.main_speed > 5.0:  # 主路速度大于5m/s
                 speed_reward += self.weights['speed_maintenance']
-            elif state.main_speed > 8.0:  # 28.8km/h - 中等
-                speed_reward += self.weights['speed_maintenance'] * 0.7
-            elif state.main_speed > 5.0:  # 18km/h - 基础
-                speed_reward += self.weights['speed_maintenance'] * 0.3
-
-            # 匝道速度奖励：4层精细分级
-            if state.ramp_speed > 10.0:  # 36km/h - 优秀
-                speed_reward += self.weights['speed_maintenance'] * 0.7
-            elif state.ramp_speed > 8.0:  # 28.8km/h - 良好
+            if state.ramp_speed > 3.0:  # 匝道速度大于3m/s
                 speed_reward += self.weights['speed_maintenance'] * 0.5
-            elif state.ramp_speed > 5.0:  # 18km/h - 中等
-                speed_reward += self.weights['speed_maintenance'] * 0.3
-            elif state.ramp_speed > 3.0:  # 10.8km/h - 基础
-                speed_reward += self.weights['speed_maintenance'] * 0.15
 
             # 4. 间隙利用奖励
             gap_reward = self._compute_gap_reward(state)
@@ -174,18 +158,18 @@ class ImprovedRewardCalculator:
 
             # ===== 期末奖励（只在最后一步）=====
             if self.is_final_step:
-                # 使用官方评分公式计算奖励
-                # 公式: S_efficiency = 100 × max(0, ΔOCR)
-                # 其中: ΔOCR = (OCR_AI - OCR_Base) / OCR_Base
-                current_ocr = env_stats.get('ocr', 0.0)
-                delta_ocr = (current_ocr - self.BASELINE_OCR) / self.BASELINE_OCR if self.BASELINE_OCR > 0 else 0
-                score = 100 * max(0, delta_ocr)
+                # 最终OCR奖励
+                final_ocr = env_stats.get('ocr', 0.0)
+                ocr_bonus = final_ocr * self.weights['ocr_final']
 
-                # 使用官方得分作为最终奖励
-                total_reward += score
+                # 总通过量奖励
+                throughput_bonus = (self.episode_throughput[junc_id] / 100.0) * self.weights['throughput_bonus']
+                throughput_bonus = min(throughput_bonus, 10.0)  # 上限
+
+                total_reward += ocr_bonus + throughput_bonus
 
             # ===== 生存奖励 =====
-            survival_bonus = 0.1  # 增加生存奖励（从0.05提高到0.1）
+            survival_bonus = 0.05  # 小的生存奖励
             total_reward += survival_bonus
 
             # ===== 奖励裁剪（已移除）=====
@@ -195,7 +179,7 @@ class ImprovedRewardCalculator:
 
             # 记录详细奖励（用于调试）
             if hasattr(agent, 'reward_breakdown'):
-                breakdown = {
+                agent.reward_breakdown = {
                     'departure_reward': departure_reward,
                     'flow_reward': flow_reward,
                     'speed_reward': speed_reward,
@@ -205,24 +189,9 @@ class ImprovedRewardCalculator:
                     'queue_penalty': queue_penalty,
                     'waiting_penalty': waiting_penalty,
                     'conflict_penalty': conflict_penalty,
-                    'speed_variance_penalty': speed_variance_penalty,
                     'survival_bonus': survival_bonus,
                     'total': total_reward
                 }
-
-                # 如果是最后一步，添加评分信息
-                if self.is_final_step:
-                    current_ocr = env_stats.get('ocr', 0.0)
-                    delta_ocr = (current_ocr - self.BASELINE_OCR) / self.BASELINE_OCR if self.BASELINE_OCR > 0 else 0
-                    score = 100 * max(0, delta_ocr)
-                    breakdown.update({
-                        'final_ocr': current_ocr,
-                        'baseline_ocr': self.BASELINE_OCR,
-                        'delta_ocr': delta_ocr,
-                        'final_score': score
-                    })
-
-                agent.reward_breakdown = breakdown
 
         return rewards
 

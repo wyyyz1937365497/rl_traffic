@@ -62,7 +62,7 @@ class ExperienceBuffer:
     
     def add(self, junction_id: str, state: torch.Tensor, vehicle_state: Dict,
             action: Dict, reward: float, value: float, log_prob: float, done: bool):
-        """添加经验 - 使用pin_memory加速传输"""
+        """添加经验 - 支持双GPU（state可能在不同的GPU上）"""
         if junction_id not in self.states:
             self.states[junction_id] = []
             self.vehicle_states[junction_id] = []
@@ -71,7 +71,8 @@ class ExperienceBuffer:
             self.values[junction_id] = []
             self.log_probs[junction_id] = []
 
-        # 如果tensor在CPU上，使用pinned memory加速后续传输
+        # state可能在不同的GPU上，保持原设备（后续在compute_gae中统一转移）
+        # 只对CPU tensor使用pin_memory加速传输
         if state.device.type == 'cpu':
             state = state.pin_memory()
 
@@ -90,7 +91,7 @@ class ExperienceBuffer:
         # 调试：打印添加经验的信息
         import logging
         logger = logging.getLogger('buffer')
-        logger.debug(f"添加经验: junction_id={junction_id}, state_shape={state.shape}, reward={reward}")
+        logger.debug(f"添加经验: junction_id={junction_id}, state_shape={state.shape}, state_device={state.device}, reward={reward}")
     
     def clear(self):
         """清空缓冲区"""
@@ -113,13 +114,61 @@ class ExperienceBuffer:
 
 
 class MultiAgentPPOTrainer:
-    """多智能体PPO训练器"""
-    
+    """
+    多智能体PPO训练器 - 支持双GPU数据处理
+
+    双GPU模式说明:
+    ---------------
+    当 use_dual_gpu=True 且有至少2张GPU时:
+    - 数据处理（特征提取、张量创建）分布在两张GPU上:
+      * cuda:0 (主设备): 处理 J5, J15 的数据
+      * cuda:1 (辅助设备): 处理 J14, J17 的数据
+    - 模型推理（forward）在主设备 cuda:0 上执行
+    - 策略更新（训练）在主设备 cuda:0 上执行
+
+    数据流向:
+    1. 收集阶段: obs_tensors 创建在对应的GPU上 (cuda:0 或 cuda:1)
+    2. 存储阶段: buffer中保持原始设备分布
+    3. 训练阶段: 在 compute_gae() 中统一转移到主设备 cuda:0
+    4. 更新阶段: 使用 cuda:0 上的数据进行梯度更新
+
+    优势:
+    - 并行数据处理，提升收集速度
+    - 负载均衡，避免单GPU显存/计算瓶颈
+    - 模型更新保持单设备，避免跨设备同步开销
+    """
+
     def __init__(self, model: MultiJunctionModel, config: PPOConfig = None,
-                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+                 use_dual_gpu: bool = True):
         self.model = model.to(device)
         self.config = config or PPOConfig()
-        self.device = device
+        self.device = device  # 主设备（策略更新）
+
+        # 双GPU数据处理配置
+        self.use_dual_gpu = use_dual_gpu and device.startswith('cuda')
+        if self.use_dual_gpu:
+            import torch
+            if torch.cuda.device_count() >= 2:
+                self.data_device_0 = device  # cuda:0 - 主设备
+                self.data_device_1 = 'cuda:1'  # cuda:1 - 辅助设备
+                print(f"[双GPU模式] 数据处理: {self.data_device_0} + {self.data_device_1}")
+            else:
+                self.use_dual_gpu = False
+                print(f"[警告] 需要至少2张GPU启用双GPU模式，当前使用单GPU: {device}")
+                self.data_device_0 = device
+                self.data_device_1 = device
+        else:
+            self.data_device_0 = device
+            self.data_device_1 = device
+
+        # 路口到设备的映射（奇数路口用device_0，偶数路口用device_1）
+        self.junction_device_map = {
+            'J5': self.data_device_0,
+            'J14': self.data_device_1,  # J14是第2个路口
+            'J15': self.data_device_0,  # J15是第3个路口
+            'J17': self.data_device_1,  # J17是第4个路口
+        }
 
         # 优化器
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.config.lr)
@@ -142,7 +191,16 @@ class MultiAgentPPOTrainer:
 
         # 熵系数
         self.entropy_coef = self.config.entropy_coef
-    
+
+        # 打印双GPU配置信息
+        if self.use_dual_gpu:
+            print(f"\n[双GPU配置]")
+            print(f"  主设备（策略更新）: {self.device}")
+            print(f"  数据处理设备0: {self.data_device_0} → J5, J15")
+            print(f"  数据处理设备1: {self.data_device_1} → J14, J17")
+            print(f"  模型设备: {next(self.model.parameters()).device}")
+            print()
+
     def collect_experience(self, env: MultiAgentEnvironment, num_steps: int) -> Dict:
         """收集经验"""
         self.model.eval()
@@ -154,20 +212,24 @@ class MultiAgentPPOTrainer:
         total_ocr = 0.0
         
         for step in range(num_steps):
-            # 准备观察张量
+            # 准备观察张量（使用双GPU并行处理）
             obs_tensors = {}
             vehicle_obs = {}
-            
+
             for junc_id, agent in env.agents.items():
+                # 获取该路口对应的数据处理设备
+                data_device = self.junction_device_map.get(junc_id, self.device)
+
+                # 在对应设备上创建状态张量
                 state_vec = agent.get_state_vector()
-                obs_tensors[junc_id] = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
-                
-                # 获取车辆观察
+                obs_tensors[junc_id] = torch.tensor(state_vec, dtype=torch.float32, device=data_device).unsqueeze(0)
+
+                # 获取车辆观察（使用对应设备）
                 controlled = agent.get_controlled_vehicles()
                 vehicle_obs[junc_id] = {
-                    'main': self._get_vehicle_features(controlled['main']) if controlled['main'] else None,
-                    'ramp': self._get_vehicle_features(controlled['ramp']) if controlled['ramp'] else None,
-                    'diverge': self._get_vehicle_features(controlled['diverge']) if controlled['diverge'] else None
+                    'main': self._get_vehicle_features(controlled['main'], device=data_device) if controlled['main'] else None,
+                    'ramp': self._get_vehicle_features(controlled['ramp'], device=data_device) if controlled['ramp'] else None,
+                    'diverge': self._get_vehicle_features(controlled['diverge'], device=data_device) if controlled['diverge'] else None
                 }
             
             # 获取动作
@@ -232,12 +294,16 @@ class MultiAgentPPOTrainer:
             'steps': len(self.buffer.dones)
         }
     
-    def _get_vehicle_features(self, vehicle_ids: List[str]) -> Optional[torch.Tensor]:
-        """获取车辆特征张量"""
+    def _get_vehicle_features(self, vehicle_ids: List[str], device: str = None) -> Optional[torch.Tensor]:
+        """获取车辆特征张量（支持指定设备）"""
         if not vehicle_ids:
             return None
 
-        MAX_VEHICLES = 300  # 最大车辆数
+        # 如果没有指定设备，使用主设备
+        if device is None:
+            device = self.device
+
+        MAX_VEHICLES = 350  # 最大车辆数
         features = []
         for veh_id in vehicle_ids[:MAX_VEHICLES]:
             try:
@@ -265,7 +331,8 @@ class MultiAgentPPOTrainer:
         while len(features) < MAX_VEHICLES:
             features.append([0.0] * 8)
 
-        return torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
+        # 在指定设备上创建tensor
+        return torch.tensor(features, dtype=torch.float32, device=device).unsqueeze(0)
     
     def _compute_log_prob(self, info: Dict, actions: Dict) -> float:
         """计算对数概率"""
@@ -334,7 +401,14 @@ class MultiAgentPPOTrainer:
 
             all_returns_list.append(returns)
             all_advantages_list.append(advantages)
-            all_states_list.extend(self.buffer.states[junc_id])  # 这些已经在GPU上
+
+            # 将所有状态转移到主设备（用于模型更新）
+            for state in self.buffer.states[junc_id]:
+                if state.device != self.device:
+                    all_states_list.append(state.to(self.device))
+                else:
+                    all_states_list.append(state)
+
             all_log_probs_list.extend(self.buffer.log_probs[junc_id])
             junction_indices_list.extend([junc_idx] * n_samples)
 
@@ -626,56 +700,61 @@ class MultiAgentPPOTrainer:
         return history
     
     def evaluate(self, env: MultiAgentEnvironment, n_episodes: int = 5) -> float:
-        """评估"""
+        """评估 - 支持双GPU数据处理"""
         self.model.eval()
-        
+
         total_ocr = 0.0
-        
+
         for _ in range(n_episodes):
             obs = env.reset()
             done = False
-            
+
             while not done:
-                # 准备观察
+                # 准备观察（使用双GPU并行处理）
                 obs_tensors = {}
                 vehicle_obs = {}
-                
+
                 for junc_id, agent in env.agents.items():
+                    # 获取该路口对应的数据处理设备
+                    data_device = self.junction_device_map.get(junc_id, self.device)
+
+                    # 在对应设备上创建状态张量
                     state_vec = agent.get_state_vector()
-                    obs_tensors[junc_id] = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
-                    
+                    obs_tensors[junc_id] = torch.tensor(state_vec, dtype=torch.float32, device=data_device).unsqueeze(0)
+
+                    # 获取车辆观察（使用对应设备）
                     controlled = agent.get_controlled_vehicles()
                     vehicle_obs[junc_id] = {
-                        'main': self._get_vehicle_features(controlled['main']),
-                        'ramp': self._get_vehicle_features(controlled['ramp']),
-                        'diverge': self._get_vehicle_features(controlled['diverge'])
+                        'main': self._get_vehicle_features(controlled['main'], device=data_device),
+                        'ramp': self._get_vehicle_features(controlled['ramp'], device=data_device),
+                        'diverge': self._get_vehicle_features(controlled['diverge'], device=data_device)
                     }
-                
+
                 # 获取动作
                 with torch.no_grad():
                     actions, _, _ = self.model(obs_tensors, vehicle_obs, deterministic=True)
-                
+
                 # 执行
                 action_dict = {}
                 for junc_id, action in actions.items():
                     action_dict[junc_id] = {}
                     agent = env.agents[junc_id]
                     controlled = agent.get_controlled_vehicles()
-                    
+
                     if controlled['main'] and 'main' in action:
                         for veh_id in controlled['main'][:1]:
                             action_dict[junc_id][veh_id] = action['main'].item() if torch.is_tensor(action['main']) else action['main']
-                    
+
                     if controlled['ramp'] and 'ramp' in action:
                         for veh_id in controlled['ramp'][:1]:
                             action_dict[junc_id][veh_id] = action['ramp'].item() if torch.is_tensor(action['ramp']) else action['ramp']
-                
+
                 obs, _, done, info = env.step(action_dict)
-            
+
             # 计算OCR
             ocr = self._compute_episode_ocr(env)
             total_ocr += ocr
-        
+
         return total_ocr / n_episodes
     
     def _compute_episode_ocr(self, env: MultiAgentEnvironment) -> float:
@@ -781,6 +860,64 @@ class MultiAgentPPOTrainer:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.entropy_coef = checkpoint.get('entropy_coef', self.config.entropy_coef)
+
+    def verify_dual_gpu_setup(self):
+        """验证双GPU配置"""
+        print("\n" + "="*70)
+        print("双GPU配置验证")
+        print("="*70)
+
+        if not self.use_dual_gpu:
+            print("❌ 双GPU模式未启用")
+            print(f"   当前使用设备: {self.device}")
+            return False
+
+        import torch
+
+        if torch.cuda.device_count() < 2:
+            print(f"❌ 检测到 {torch.cuda.device_count()} 张GPU，需要至少2张GPU")
+            return False
+
+        print(f"✓ 检测到 {torch.cuda.device_count()} 张GPU")
+
+        # 检查设备映射
+        print("\n路口到设备映射:")
+        for junc_id, device in self.junction_device_map.items():
+            print(f"  {junc_id}: {device}")
+
+        # 测试设备可用性
+        print("\n设备可用性测试:")
+        for i in range(torch.cuda.device_count()):
+            device = f'cuda:{i}'
+            try:
+                # 创建测试张量
+                test_tensor = torch.randn(100, 100, device=device)
+                # 执行测试计算
+                result = test_tensor @ test_tensor.T
+                mem_allocated = torch.cuda.memory_allocated(i) / 1024**3
+                mem_reserved = torch.cuda.memory_reserved(i) / 1024**3
+                print(f"  ✓ {device}: 可用 | 显存: {mem_allocated:.2f}GB / {mem_reserved:.2f}GB")
+                del test_tensor, result
+            except Exception as e:
+                print(f"  ❌ {device}: 不可用 ({e})")
+                return False
+
+        # 测试跨设备数据传输
+        print("\n跨设备数据传输测试:")
+        try:
+            test_tensor_0 = torch.randn(10, device='cuda:0')
+            test_tensor_1 = test_tensor_0.to('cuda:1')
+            test_tensor_back = test_tensor_1.to('cuda:0')
+            print(f"  ✓ cuda:0 → cuda:1 → cuda:0: 成功")
+        except Exception as e:
+            print(f"  ❌ 跨设备传输失败: {e}")
+            return False
+
+        print("\n" + "="*70)
+        print("✓ 双GPU配置验证通过")
+        print("="*70)
+        return True
+
 
 
 def main():
