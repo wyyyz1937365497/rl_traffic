@@ -35,13 +35,8 @@ from junction_agent import JUNCTION_CONFIGS
 from junction_network import create_junction_model, NetworkConfig
 from junction_trainer import PPOConfig, MultiAgentPPOTrainer
 
-# 尝试导入libsumo
-try:
-    import libsumo as traci_wrapper
-    USE_LIBSUMO = True
-except ImportError:
-    import traci as traci_wrapper
-    USE_LIBSUMO = False
+# 直接使用 libsumo（参考 fast_pkl_generator.py）
+import libsumo as traci
 
 
 def print_header(title: str):
@@ -54,11 +49,8 @@ def check_environment():
     """检查运行环境"""
     print("\n环境检查:")
 
-    try:
-        import libsumo
-        print("  ✓ libsumo 可用（高速模式）")
-    except ImportError:
-        print("  ⚠ libsumo 不可用，将使用 traci")
+    # libsumo 必须可用
+    print("  ✓ libsumo 已加载（高速模式）")
 
     cuda_available = torch.cuda.is_available()
     print(f"  ✓ CUDA: {cuda_available}")
@@ -173,7 +165,7 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
 
                 # 1. 初始热身步进
                 for _ in range(10):
-                    traci_wrapper.simulationStep()
+                    traci.simulationStep()
                     self.current_step += 1
 
                 # 2. 设置订阅（订阅模式优化）
@@ -181,7 +173,7 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
 
                 # ========== 关键修复：刷新订阅数据 ==========
                 # 订阅请求发出后，必须执行一次 simulationStep 才会有数据返回
-                traci_wrapper.simulationStep()
+                traci.simulationStep()
                 self.current_step += 1
 
                 # 然后必须调用 update_results 将数据从 traci 拉取到 SubscriptionManager 缓存中
@@ -227,9 +219,9 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
 
                 # 获取所有CV车辆
                 all_cv_vehicles = []
-                for veh_id in traci_wrapper.vehicle.getIDList():
+                for veh_id in traci.vehicle.getIDList():
                     try:
-                        if traci_wrapper.vehicle.getTypeID(veh_id) == 'CV':
+                        if traci.vehicle.getTypeID(veh_id) == 'CV':
                             all_cv_vehicles.append(veh_id)
                     except:
                         continue
@@ -240,7 +232,7 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 # 为每个CV车辆分配路口
                 for veh_id in all_cv_vehicles:
                     try:
-                        current_edge = traci_wrapper.vehicle.getRoadID(veh_id)
+                        current_edge = traci.vehicle.getRoadID(veh_id)
 
                         assigned_junction = None
 
@@ -337,7 +329,7 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
 
             for veh_id in assigned_cvs:
                 try:
-                    current_edge = traci_wrapper.vehicle.getRoadID(veh_id)
+                    current_edge = traci.vehicle.getRoadID(veh_id)
 
                     if current_edge in config.ramp_incoming or current_edge in config.ramp_outgoing:
                         ramp_cvs.append(veh_id)
@@ -366,18 +358,18 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 self._apply_actions(actions)
 
                 # 仿真一步
-                traci_wrapper.simulationStep()
+                traci.simulationStep()
                 self.current_step += 1
 
                 # 维护episode累计计数（单步 -> 累计）
-                self.episode_arrived += traci_wrapper.simulation.getArrivedNumber()
-                self.episode_departed += traci_wrapper.simulation.getDepartedNumber()
+                self.episode_arrived += traci.simulation.getArrivedNumber()
+                self.episode_departed += traci.simulation.getDepartedNumber()
 
                 # ========== 更新订阅结果 ==========
                 self.sub_manager.update_results()
 
                 # 为新车辆设置订阅
-                current_vehicles = set(traci_wrapper.vehicle.getIDList())
+                current_vehicles = set(traci.vehicle.getIDList())
                 new_vehicles = current_vehicles - self.sub_manager.subscribed_vehicles
                 if new_vehicles:
                     self.sub_manager.setup_vehicle_subscription(list(new_vehicles))
@@ -416,36 +408,30 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 raise
 
         def _start_sumo(self):
-            """启动SUMO"""
-            import sys
-            import traci as traci_global  # 导入全局traci模块
-
+            """启动SUMO（使用 libsumo）"""
             try:
                 if self.is_running:
                     try:
-                        traci_wrapper.close()
+                        traci.close()
                         self.logger.debug("关闭旧的SUMO连接")
                     except Exception as e:
                         self.logger.warning(f"关闭SUMO连接时出错: {e}")
 
-                sumo_binary = "sumo"
-
-                if USE_LIBSUMO:
-                    sumo_cmd = [sumo_binary, "-c", self.sumo_cfg, "--no-warnings", "true", "--seed", str(self.seed)]
-                    traci_wrapper.start(sumo_cmd)
-                else:
-                    sumo_cmd = [sumo_binary, "-c", self.sumo_cfg, "--remote-port", "0", "--no-warnings", "true", "--seed", str(self.seed)]
-                    traci_wrapper.start(sumo_cmd)
+                # 使用 libsumo 启动（参考 fast_pkl_generator.py）
+                sumo_cmd = [
+                    "sumo",
+                    "-c", self.sumo_cfg,
+                    "--no-warnings", "true",
+                    "--seed", str(self.seed)
+                ]
+                traci.start(sumo_cmd)
 
                 self.is_running = True
                 self.logger.info(f"SUMO已启动 (seed={self.seed})")
 
-                # 关键修复：设置订阅模式模块的traci连接
-                # 1. 设置全局traci模块（sys.modules）
-                sys.modules['traci'] = traci_wrapper
-                # 2. 直接设置订阅模式模块的traci属性（因为模块级别引用已固定）
-                junction_agent.traci = traci_wrapper
-                self.logger.debug("已设置traci连接（订阅模式兼容）")
+                # 设置 junction_agent 的 traci 连接
+                junction_agent.traci = traci
+                self.logger.debug("已设置traci连接（libsumo模式）")
 
                 # 配置vType参数（关键优化！）
                 self._configure_vtypes()
@@ -463,7 +449,7 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                     try:
                         speed_limit = 13.89
                         target_speed = speed_limit * (0.3 + 0.9 * action)
-                        traci_wrapper.vehicle.setSpeed(veh_id, target_speed)
+                        traci.vehicle.setSpeed(veh_id, target_speed)
                     except Exception as e:
                         failed_count += 1
                         if failed_count <= 3:  # 只记录前3个错误
@@ -473,47 +459,64 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 self.logger.debug(f"总计 {failed_count} 个车辆速度设置失败")
 
         def _compute_rewards(self):
-            """计算奖励（使用改进版，包含正向奖励）"""
-            # 使用改进的奖励计算器
-            from improved_rewards import ImprovedRewardCalculator
+            """计算奖励（使用Baseline OCR比较）"""
+            # 使用基于Baseline OCR比较的奖励计算器
+            from baseline_ocr_rewards import BaselineOCRRewardCalculator
 
             if not hasattr(self, 'reward_calculator'):
-                self.reward_calculator = ImprovedRewardCalculator()
+                # 检查是否有baseline文件（优先级：BC模型 > Expert(10步) > Expert(100步)）
+                baseline_file = 'baseline_ocr/bc_baseline_10step.pkl'
+                if not os.path.exists(baseline_file):
+                    # fallback到专家策略10步版本
+                    baseline_file = 'baseline_ocr/expert_baseline_10step.pkl'
+                    if not os.path.exists(baseline_file):
+                        # fallback到专家策略100步版本
+                        baseline_file = 'baseline_ocr/expert_baseline.pkl'
+                        if not os.path.exists(baseline_file):
+                            self.logger.warning(f"未找到baseline文件")
+                            self.logger.warning(f"  将使用固定baseline OCR = 0.95")
+                            self.logger.warning(f"  建议先运行: python baseline_ocr_rewards.py --model bc_checkpoints/best_model.pt")
+                            baseline_file = None
 
-            # 获取环境统计信息
+                if baseline_file:
+                    self.logger.info(f"加载baseline OCR文件: {baseline_file}")
+
+                self.reward_calculator = BaselineOCRRewardCalculator(
+                    baseline_file=baseline_file,
+                    reward_weight=100.0  # OCR增量奖励权重
+                )
+
+            # 获取当前OCR
             try:
-                ocr = self._compute_current_ocr()
+                current_ocr = self._compute_current_ocr()
             except:
-                ocr = 0.0
+                current_ocr = 0.0
 
             env_stats = {
-                'ocr': ocr,
+                'ocr': current_ocr,
                 'step': self.current_step
             }
 
+            # 计算奖励（OCR增量 + 瞬时辅助）
             rewards = self.reward_calculator.compute_rewards(self.agents, env_stats)
 
-            # 调试：每1000步打印一次奖励详情
-            if self.current_step % 1000 == 0 and self.current_step > 0:
+            # 调试：每500步打印一次奖励详情
+            if self.current_step % 500 == 0 and self.current_step > 0:
                 for junc_id, reward in rewards.items():
                     agent = self.agents.get(junc_id)
                     if agent and hasattr(agent, 'reward_breakdown') and agent.reward_breakdown:
                         bd = agent.reward_breakdown
                         self.logger.info(
                             f"路口 {junc_id} 奖励: {reward:.4f} "
-                            f"[departure:{bd.get('departure_reward', 0):.2f}, "
-                            f"flow:{bd.get('flow_reward', 0):.2f}, "
-                            f"speed:{bd.get('speed_reward', 0):.2f}, "
-                            f"gap:{bd.get('gap_reward', 0):.2f}, "
-                            f"no_stops:{bd.get('no_stops_reward', 0):.2f}, "
-                            f"capacity:{bd.get('capacity_reward', 0):.2f}, "
-                            f"queue:{bd.get('queue_penalty', 0):.2f}, "
-                            f"wait:{bd.get('waiting_penalty', 0):.2f}, "
-                            f"conflict:{bd.get('conflict_penalty', 0):.2f}, "
-                            f"survival:{bd.get('survival_bonus', 0):.2f}]"
+                            f"[OCR delta={bd.get('ocr_delta', 0):+.4f} "
+                            f"(current={bd.get('current_ocr', 0):.4f}, "
+                            f"baseline={bd.get('baseline_ocr', 0):.4f}), "
+                            f"ocr_reward={bd.get('ocr_reward', 0):.2f}, "
+                            f"speed={bd.get('speed_reward', 0):.3f}, "
+                            f"throughput={bd.get('throughput_reward', 0):.3f}]"
                         )
                     else:
-                        self.logger.info(f"路口 {junc_id} 奖励: {reward:.4f}")
+                        self.logger.info(f"路口 {junc_id} 奖励: {reward:.4f} (OCR={current_ocr:.4f})")
 
             return rewards
 
@@ -538,12 +541,12 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 enroute_completion = 0.0
                 enroute_count = 0
 
-                for veh_id in traci_wrapper.vehicle.getIDList():
+                for veh_id in traci.vehicle.getIDList():
                     try:
                         # 获取车辆已行驶距离
-                        current_edge = traci_wrapper.vehicle.getRoadID(veh_id)
-                        current_position = traci_wrapper.vehicle.getLanePosition(veh_id)
-                        route_edges = traci_wrapper.vehicle.getRoute(veh_id)
+                        current_edge = traci.vehicle.getRoadID(veh_id)
+                        current_position = traci.vehicle.getLanePosition(veh_id)
+                        route_edges = traci.vehicle.getRoute(veh_id)
 
                         # 计算已行驶距离
                         traveled_distance = 0.0
@@ -555,12 +558,12 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                             else:
                                 # 已通过的边，加上边全长
                                 try:
-                                    edge_length = traci_wrapper.edge.getLength(edge)
+                                    edge_length = traci.edge.getLength(edge)
                                     traveled_distance += edge_length
                                 except:
                                     try:
                                         lane_id = f"{edge}_0"
-                                        edge_length = traci_wrapper.lane.getLength(lane_id)
+                                        edge_length = traci.lane.getLength(lane_id)
                                         traveled_distance += edge_length
                                     except:
                                         traveled_distance += 100.0
@@ -569,12 +572,12 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                         total_distance = 0.0
                         for edge in route_edges:
                             try:
-                                edge_length = traci_wrapper.edge.getLength(edge)
+                                edge_length = traci.edge.getLength(edge)
                                 total_distance += edge_length
                             except:
                                 try:
                                     lane_id = f"{edge}_0"
-                                    edge_length = traci_wrapper.lane.getLength(lane_id)
+                                    edge_length = traci.lane.getLength(lane_id)
                                     total_distance += edge_length
                                 except:
                                     total_distance += 100.0
@@ -624,16 +627,16 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
 
             try:
                 # CV参数：消除随机减速，平滑跟车
-                traci_wrapper.vehicletype.setImperfection('CV', sigma)
-                traci_wrapper.vehicletype.setTau('CV', tau)
-                traci_wrapper.vehicletype.setAccel('CV', float(accel))
-                traci_wrapper.vehicletype.setDecel('CV', float(decel))
+                traci.vehicletype.setImperfection('CV', sigma)
+                traci.vehicletype.setTau('CV', tau)
+                traci.vehicletype.setAccel('CV', float(accel))
+                traci.vehicletype.setDecel('CV', float(decel))
 
                 # HV参数：同样优化
-                traci_wrapper.vehicletype.setImperfection('HV', sigma)
-                traci_wrapper.vehicletype.setTau('HV', tau)
-                traci_wrapper.vehicletype.setAccel('HV', float(accel))
-                traci_wrapper.vehicletype.setDecel('HV', float(decel))
+                traci.vehicletype.setImperfection('HV', sigma)
+                traci.vehicletype.setTau('HV', tau)
+                traci.vehicletype.setAccel('HV', float(accel))
+                traci.vehicletype.setDecel('HV', float(decel))
 
                 self.logger.info(f"vType配置: sigma={sigma}, tau={tau}, accel={accel}, decel={decel}")
             except Exception as e:
@@ -666,16 +669,16 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
             }
 
             try:
-                for veh_id in traci_wrapper.vehicle.getIDList():
+                for veh_id in traci.vehicle.getIDList():
                     # 只控制CV车辆
-                    if traci_wrapper.vehicle.getTypeID(veh_id) != 'CV':
+                    if traci.vehicle.getTypeID(veh_id) != 'CV':
                         continue
 
                     try:
                         # 获取当前位置
-                        road_id = traci_wrapper.vehicle.getRoadID(veh_id)
-                        lane_id = traci_wrapper.vehicle.getLaneID(veh_id)
-                        lane_pos = traci_wrapper.vehicle.getLanePosition(veh_id)
+                        road_id = traci.vehicle.getRoadID(veh_id)
+                        lane_id = traci.vehicle.getLaneID(veh_id)
+                        lane_pos = traci.vehicle.getLanePosition(veh_id)
 
                         # 车换不在主路上，跳过
                         if road_id not in NEXT_EDGE:
@@ -684,10 +687,10 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                         # 检查是否接近边末尾
                         lane_len = 0
                         try:
-                            lane_len = traci_wrapper.lane.getLength(lane_id)
+                            lane_len = traci.lane.getLength(lane_id)
                         except:
                             try:
-                                edge_len = traci_wrapper.edge.getLength(road_id)
+                                edge_len = traci.edge.getLength(road_id)
                                 lane_len = edge_len
                             except:
                                 continue
@@ -707,7 +710,7 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                             next_edge = NEXT_EDGE[current_edge]
 
                             try:
-                                ds_speed = traci_wrapper.edge.getLastStepMeanSpeed(next_edge)
+                                ds_speed = traci.edge.getLastStepMeanSpeed(next_edge)
                                 min_ds_speed = min(min_ds_speed, ds_speed)
 
                                 if ds_speed < congest_speed:
@@ -720,12 +723,12 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
 
                         # 如果下游拥堵且当前速度过快，温和减速
                         if congested:
-                            current_speed = traci_wrapper.vehicle.getSpeed(veh_id)
+                            current_speed = traci.vehicle.getSpeed(veh_id)
                             target_speed = max(min_ds_speed * speed_factor, speed_floor)
 
                             if current_speed > target_speed:
                                 # 使用slowDown温和减速（3秒持续时间）
-                                traci_wrapper.vehicle.slowDown(veh_id, target_speed, 3.0)
+                                traci.vehicle.slowDown(veh_id, target_speed, 3.0)
 
                     except Exception as e:
                         # 单辆车控制失败不影响其他车辆
@@ -739,7 +742,7 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
             """关闭环境"""
             if self.is_running:
                 try:
-                    traci_wrapper.close()
+                    traci.close()
                     self.logger.info("SUMO连接已关闭")
                 except Exception as e:
                     self.logger.warning(f"关闭SUMO连接时出错: {e}")
@@ -1056,13 +1059,13 @@ def _get_vehicle_features(vehicle_ids, device):
     for veh_id in vehicle_ids[:MAX_VEHICLES]:
         try:
             features.append([
-                normalize_speed(traci_wrapper.vehicle.getSpeed(veh_id)),
-                traci_wrapper.vehicle.getLanePosition(veh_id) / 500.0,
-                traci_wrapper.vehicle.getLaneIndex(veh_id) / 3.0,
-                traci_wrapper.vehicle.getWaitingTime(veh_id) / 60.0,
-                traci_wrapper.vehicle.getAcceleration(veh_id) / 5.0,
-                1.0 if traci_wrapper.vehicle.getTypeID(veh_id) == 'CV' else 0.0,
-                traci_wrapper.vehicle.getRouteIndex(veh_id) / 10.0,
+                normalize_speed(traci.vehicle.getSpeed(veh_id)),
+                traci.vehicle.getLanePosition(veh_id) / 500.0,
+                traci.vehicle.getLaneIndex(veh_id) / 3.0,
+                traci.vehicle.getWaitingTime(veh_id) / 60.0,
+                traci.vehicle.getAcceleration(veh_id) / 5.0,
+                1.0 if traci.vehicle.getTypeID(veh_id) == 'CV' else 0.0,
+                traci.vehicle.getRouteIndex(veh_id) / 10.0,
                 0.0
             ])
         except Exception as e:
@@ -1150,6 +1153,32 @@ def train(args):
     model = create_junction_model(JUNCTION_CONFIGS, net_config)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model.to(device)
+
+    # 加载预训练模型（如果有）
+    if args.pretrained:
+        print(f"\n加载预训练模型: {args.pretrained}")
+        try:
+            # PyTorch 2.6+ 需要设置 weights_only=False 以加载包含 numpy 数据的 checkpoint
+            checkpoint = torch.load(args.pretrained, map_location=device, weights_only=False)
+
+            # 支持两种checkpoint格式
+            if isinstance(checkpoint, dict):
+                if 'model_state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    print(f"  ✓ 从checkpoint加载模型")
+                    if 'epoch' in checkpoint:
+                        print(f"  ✓ 预训练epoch: {checkpoint['epoch']}")
+                else:
+                    model.load_state_dict(checkpoint)
+                    print(f"  ✓ 直接加载state_dict")
+            else:
+                model.load_state_dict(checkpoint)
+                print(f"  ✓ 直接加载模型")
+
+            print(f"  ✓ 预训练模型加载成功")
+        except Exception as e:
+            print(f"  ✗ 预训练模型加载失败: {e}")
+            print(f"  ℹ 将从头开始训练")
 
     # 优化器
     optimizer = torch.optim.Adam(model.parameters(), lr=ppo_config.lr)
@@ -1357,7 +1386,10 @@ def train(args):
                 min_ocr = np.min(worker_ocrs)
                 max_ocr = np.max(worker_ocrs)
                 tqdm.write(f"  - 平均OCR: {mean_ocr:.4f} ± {std_ocr:.4f} (范围: {min_ocr:.4f} - {max_ocr:.4f})")
-                tqdm.write(f"  - 得分预估: {(mean_ocr - 0.8812) / 0.8812 * 100:.2f} (基准OCR=0.8812)")
+                # 使用实际的baseline OCR进行评分
+                baseline_ocr = self.reward_calculator.get_final_baseline_ocr()
+                score_estimate = (mean_ocr - baseline_ocr) / baseline_ocr * 100
+                tqdm.write(f"  - 得分预估: {score_estimate:.2f} (基准OCR={baseline_ocr:.4f})")
 
             tqdm.write(f"  - 平均奖励: {mean_reward_before:.4f}")  # 使用训练前计算的奖励
             tqdm.write(f"  - 损失: {update_result['loss']:.4f}")
@@ -1427,10 +1459,12 @@ def train(args):
             print(f"  最终OCR: {iteration_ocr_history[-1]:.4f}")
             print(f"  最佳OCR: {best_ocr:.4f}")
             print(f"  平均OCR: {np.mean(iteration_ocr_history):.4f} ± {np.std(iteration_ocr_history):.4f}")
-            print(f"\n得分预估 (基准OCR=0.8812):")
-            print(f"  初始得分: {(iteration_ocr_history[0] - 0.8812) / 0.8812 * 100:.2f}")
-            print(f"  最终得分: {(iteration_ocr_history[-1] - 0.8812) / 0.8812 * 100:.2f}")
-            print(f"  最佳得分: {(best_ocr - 0.8812) / 0.8812 * 100:.2f}")
+            # 使用实际的baseline OCR进行评分
+            baseline_ocr = self.reward_calculator.get_final_baseline_ocr()
+            print(f"\n得分预估 (基准OCR={baseline_ocr:.4f}):")
+            print(f"  初始得分: {(iteration_ocr_history[0] - baseline_ocr) / baseline_ocr * 100:.2f}")
+            print(f"  最终得分: {(iteration_ocr_history[-1] - baseline_ocr) / baseline_ocr * 100:.2f}")
+            print(f"  最佳得分: {(best_ocr - baseline_ocr) / baseline_ocr * 100:.2f}")
 
             # OCR改进
             ocr_improvement = (iteration_ocr_history[-1] - iteration_ocr_history[0]) / iteration_ocr_history[0] * 100
@@ -1465,6 +1499,7 @@ def main():
     parser.add_argument('--update-frequency', type=int, default=2048, help='更新频率')
     parser.add_argument('--save-dir', type=str, default='checkpoints', help='保存目录')
     parser.add_argument('--log-dir', type=str, default='logs', help='日志目录')
+    parser.add_argument('--pretrained', type=str, default=None, help='预训练模型路径（行为克隆模型）')
 
     args = parser.parse_args()
 
