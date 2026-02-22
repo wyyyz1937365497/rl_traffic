@@ -2,6 +2,13 @@
 多智能体路口交通控制系统 - 简化版
 只支持CUDA训练 + 文件IO并行数据收集
 """
+import sys
+import io
+
+# 将标准输出强制设置为 UTF-8 编码
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 
 import os
 from vehicle_type_config import normalize_speed, get_vehicle_max_speed
@@ -133,6 +140,13 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
             # 创建订阅管理器（订阅模式优化）
             self.sub_manager = SubscriptionManager()
 
+            # OCR追踪：episode累计计数（SUMO返回的是单步计数）
+            self.episode_arrived = 0
+            self.episode_departed = 0
+
+            # ✅ 全局CV车辆分配缓存（确保每个CV只被一个路口控制）
+            self._global_cv_assignment: Dict[str, str] = {}  # {veh_id: junction_id}
+
             try:
                 for junc_id in JUNCTION_CONFIGS.keys():
                     self.agents[junc_id] = JunctionAgent(
@@ -175,8 +189,17 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 # ==========================================
 
                 # 4. 观察状态（此时 edge_results 已有数据）
-                observations = {junc_id: self.agents[junc_id].observe() for junc_id in self.agents.keys()}
-                self.logger.info(f"环境重置完成（订阅模式），current_step={self.current_step}")
+                observations = {}
+                for junc_id in self.agents.keys():
+                    state = self.agents[junc_id].observe()
+                    observations[junc_id] = self.agents[junc_id].get_state_vector(state)  # ✅ 返回向量，不是 JunctionState
+
+                # 重置episode累计计数（SUMO getArrivedNumber/getDepartedNumber 为单步计数）
+                self.episode_arrived = 0
+                self.episode_departed = 0
+
+                self.logger.info(f"环境重置完成（订阅模式），current_step={self.current_step}, "
+                               f"episode计数已清零")
                 return observations
 
             except Exception as e:
@@ -193,6 +216,146 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 self.logger.error(f"设置订阅失败: {e}\n{tb.format_exc()}")
                 raise
 
+        def _assign_all_cv_vehicles(self):
+            """
+            全局分配所有CV车辆给各个路口
+
+            基于road_topology_hardcoded.py的拓扑关系
+            """
+            try:
+                from road_topology_hardcoded import JUNCTION_CONFIG, EDGE_TOPOLOGY
+
+                # 获取所有CV车辆
+                all_cv_vehicles = []
+                for veh_id in traci_wrapper.vehicle.getIDList():
+                    try:
+                        if traci_wrapper.vehicle.getTypeID(veh_id) == 'CV':
+                            all_cv_vehicles.append(veh_id)
+                    except:
+                        continue
+
+                # 清空之前的分配
+                self._global_cv_assignment.clear()
+
+                # 为每个CV车辆分配路口
+                for veh_id in all_cv_vehicles:
+                    try:
+                        current_edge = traci_wrapper.vehicle.getRoadID(veh_id)
+
+                        assigned_junction = None
+
+                        # J5的影响范围：E2(主路上游) + E23(匝道) + -E3(反向冲突)
+                        if current_edge in ['E2', 'E23', '-E3']:
+                            assigned_junction = 'J5'
+
+                        # J14的影响范围：E9(主路上游) + E15(匝道) + -E10(反向冲突)
+                        elif current_edge in ['E9', 'E15', '-E10']:
+                            assigned_junction = 'J14'
+
+                        # J15的影响范围：E10(主路上游) + E17(匝道) + -E11(反向冲突) + E16(转出)
+                        elif current_edge in ['E10', 'E17', '-E11', 'E16']:
+                            assigned_junction = 'J15'
+
+                        # J17的影响范围：E12(主路上游) + E19(匝道) + -E13(反向冲突) + E18/E20(转出)
+                        elif current_edge in ['E12', 'E19', '-E13', 'E18', 'E20']:
+                            assigned_junction = 'J17'
+
+                        # 如果车辆不在任何路口的直接影响范围内，根据拓扑关系分配
+                        if assigned_junction is None:
+                            if current_edge in EDGE_TOPOLOGY:
+                                edge_info = EDGE_TOPOLOGY[current_edge]
+                                for downstream_edge in edge_info.downstream:
+                                    for junc_id, junc_config in JUNCTION_CONFIG.items():
+                                        affected_edges = (
+                                            junc_config['main_incoming'] +
+                                            junc_config.get('ramp_incoming', []) +
+                                            junc_config.get('main_reverse', []) +
+                                            junc_config.get('ramp_outgoing', [])
+                                        )
+                                        if downstream_edge in affected_edges:
+                                            assigned_junction = junc_id
+                                            break
+                                    if assigned_junction:
+                                        break
+
+                        # 默认分配策略
+                        if assigned_junction is None:
+                            if current_edge.startswith('E') and not current_edge.startswith('-E'):
+                                if 'E1' <= current_edge <= 'E9':
+                                    assigned_junction = 'J14'
+                                elif 'E10' <= current_edge <= 'E13':
+                                    assigned_junction = 'J15'
+                                else:
+                                    assigned_junction = 'J14'
+                            elif current_edge.startswith('-E'):
+                                if '-E1' <= current_edge <= '-E3':
+                                    assigned_junction = 'J5'
+                                elif '-E4' <= current_edge <= '-E11':
+                                    assigned_junction = 'J15'
+                                elif '-E12' <= current_edge <= '-E13':
+                                    assigned_junction = 'J17'
+                                else:
+                                    assigned_junction = 'J5'
+                            else:
+                                assigned_junction = list(self.agents.keys())[0] if self.agents else 'J14'
+
+                        self._global_cv_assignment[veh_id] = assigned_junction
+
+                    except Exception as e:
+                        default_junction = list(self.agents.keys())[0] if self.agents else 'J14'
+                        self._global_cv_assignment[veh_id] = default_junction
+
+            except Exception as e:
+                self.logger.warning(f"全局CV车辆分配失败: {e}")
+
+        def get_controlled_vehicles_for_junction(self, junc_id: str) -> dict[str, list[str]]:
+            """
+            获取指定路口控制的所有CV车辆
+
+            Args:
+                junc_id: 路口ID
+
+            Returns:
+                {'main': [...], 'ramp': [...], 'diverge': [...]}
+            """
+            if junc_id not in self.agents:
+                return {'main': [], 'ramp': [], 'diverge': []}
+
+            agent = self.agents[junc_id]
+            config = agent.config
+
+            # 获取分配给这个路口的所有CV车辆
+            assigned_cvs = [
+                veh_id for veh_id, assigned_junc in self._global_cv_assignment.items()
+                if assigned_junc == junc_id
+            ]
+
+            # 根据车辆所在的边，分类到main/ramp/diverge
+            main_cvs = []
+            ramp_cvs = []
+            diverge_cvs = []
+
+            for veh_id in assigned_cvs:
+                try:
+                    current_edge = traci_wrapper.vehicle.getRoadID(veh_id)
+
+                    if current_edge in config.ramp_incoming or current_edge in config.ramp_outgoing:
+                        ramp_cvs.append(veh_id)
+                    elif agent.junction_type == junction_agent.JunctionType.TYPE_B and \
+                         (current_edge in config.ramp_outgoing or \
+                          any(edge in current_edge for edge in ['E16', 'E18', 'E20'])):
+                        diverge_cvs.append(veh_id)
+                    else:
+                        main_cvs.append(veh_id)
+                except:
+                    main_cvs.append(veh_id)
+
+            return {
+                'main': main_cvs,
+                'ramp': ramp_cvs,
+                'diverge': diverge_cvs if agent.junction_type == junction_agent.JunctionType.TYPE_B else []
+            }
+
         def step(self, actions):
             """执行一步"""
             import time
@@ -206,6 +369,10 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 traci_wrapper.simulationStep()
                 self.current_step += 1
 
+                # 维护episode累计计数（单步 -> 累计）
+                self.episode_arrived += traci_wrapper.simulation.getArrivedNumber()
+                self.episode_departed += traci_wrapper.simulation.getDepartedNumber()
+
                 # ========== 更新订阅结果 ==========
                 self.sub_manager.update_results()
 
@@ -218,12 +385,19 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 # 清理已离开的车辆
                 self.sub_manager.cleanup_left_vehicles(current_vehicles)
 
-                # === 应用主动速度控制（每一步都执行）===
-                self._active_cv_control()
+                # ✅ 更新全局CV车辆分配
+                self._assign_all_cv_vehicles()
+
+                # ❌ 禁用主动控制，让RL模型完全接管车辆控制
+                # 原主动控制会覆盖模型设置的速度，导致模型无法学习
+                # self._active_cv_control()
 
                 # 观察新状态（订阅模式优化）
                 obs_start = time.time()
-                observations = {junc_id: self.agents[junc_id].observe() for junc_id in self.agents.keys()}
+                observations = {}
+                for junc_id in self.agents.keys():
+                    state = self.agents[junc_id].observe()
+                    observations[junc_id] = self.agents[junc_id].get_state_vector(state)  # ✅ 返回向量，不是 JunctionState
                 obs_time = (time.time() - obs_start) * 1000  # ms
 
                 # 计算奖励
@@ -351,25 +525,25 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
             OCR = (N_arrived + Σ(d_i_traveled / d_i_total)) / N_total
 
             其中:
-            - N_arrived: 已到达车辆数
+            - N_arrived: 已到达车辆数（episode期间）
             - d_i_traveled: 在途车辆i已行驶的距离
             - d_i_total: 在途车辆i的OD路径总长度
             - N_total: 总车辆数（已到达 + 在途）
             """
             try:
-                import traci
-
-                # 已到达车辆数
-                n_arrived = traci.simulation.getArrivedNumber()
+                # episode累计到达数
+                n_arrived = self.episode_arrived
 
                 # 在途车辆完成度
                 enroute_completion = 0.0
-                for veh_id in traci.vehicle.getIDList():
+                enroute_count = 0
+
+                for veh_id in traci_wrapper.vehicle.getIDList():
                     try:
                         # 获取车辆已行驶距离
-                        current_edge = traci.vehicle.getRoadID(veh_id)
-                        current_position = traci.vehicle.getLanePosition(veh_id)
-                        route_edges = traci.vehicle.getRoute(veh_id)
+                        current_edge = traci_wrapper.vehicle.getRoadID(veh_id)
+                        current_position = traci_wrapper.vehicle.getLanePosition(veh_id)
+                        route_edges = traci_wrapper.vehicle.getRoute(veh_id)
 
                         # 计算已行驶距离
                         traveled_distance = 0.0
@@ -381,28 +555,26 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                             else:
                                 # 已通过的边，加上边全长
                                 try:
-                                    edge_length = traci.edge.getLength(edge)
+                                    edge_length = traci_wrapper.edge.getLength(edge)
                                     traveled_distance += edge_length
                                 except:
-                                    # 如果边不存在，尝试获取车道长度
                                     try:
                                         lane_id = f"{edge}_0"
-                                        edge_length = traci.lane.getLength(lane_id)
+                                        edge_length = traci_wrapper.lane.getLength(lane_id)
                                         traveled_distance += edge_length
                                     except:
-                                        # 如果还是失败，使用默认值100m
                                         traveled_distance += 100.0
 
                         # 计算总路径长度
                         total_distance = 0.0
                         for edge in route_edges:
                             try:
-                                edge_length = traci.edge.getLength(edge)
+                                edge_length = traci_wrapper.edge.getLength(edge)
                                 total_distance += edge_length
                             except:
                                 try:
                                     lane_id = f"{edge}_0"
-                                    edge_length = traci.lane.getLength(lane_id)
+                                    edge_length = traci_wrapper.lane.getLength(lane_id)
                                     total_distance += edge_length
                                 except:
                                     total_distance += 100.0
@@ -411,23 +583,33 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                         if total_distance > 0:
                             completion_ratio = min(traveled_distance / total_distance, 1.0)
                             enroute_completion += completion_ratio
+                            enroute_count += 1
 
                     except Exception as e:
-                        # 如果某辆车计算失败，跳过
                         continue
 
                 # 总车辆数 = 已到达 + 在途
-                n_total = n_arrived + len(traci.vehicle.getIDList())
+                n_total = n_arrived + enroute_count
 
                 if n_total == 0:
                     return 0.0
 
                 # OCR = (已到达 + 在途车辆完成度之和) / 总车辆数
                 ocr = (n_arrived + enroute_completion) / n_total
+
+                # 调试信息（仅在最后几步打印）
+                if self.current_step >= 3590:
+                    n_departed = self.episode_departed
+                    self.logger.info(
+                        f"OCR详情 [步{self.current_step}]: "
+                        f"出发={n_departed}, 到达={n_arrived}, 在途={enroute_count}, "
+                        f"完成度={enroute_completion:.2f}, OCR={ocr:.4f}"
+                    )
+
                 return min(ocr, 1.0)
 
             except Exception as e:
-                self.logger.debug(f"计算OCR失败: {e}")
+                self.logger.warning(f"计算OCR失败: {e}")
                 return 0.0
 
         def _configure_vtypes(self):
@@ -616,34 +798,47 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
 
         # 收集经验 - 运行完整的3600步episode
         episode_start = time.time()
-        obs = env.reset()
+        obs = env.reset()  # obs 是 {junc_id: state_vector}
         experiences = []
         total_rewards = {}
         step_count = 0
 
         # 运行完整的episode，直到环境done
         while True:
-            # 准备观察
+            # 准备观察 - env.reset() 和 env.step() 都返回状态向量
             obs_tensors = {}
             vehicle_obs = {}
 
-            for junc_id, agent in env.agents.items():
+            for junc_id, state_vec in obs.items():
                 try:
-                    state_vec = agent.get_state_vector()
                     obs_tensors[junc_id] = torch.tensor(state_vec, dtype=torch.float32, device=device).unsqueeze(0)
 
-                    controlled = agent.get_controlled_vehicles()
+                    # ✅ 使用全局CV分配（控制所有车道上的CV车辆）
+                    controlled = env.get_controlled_vehicles_for_junction(junc_id)
                     vehicle_obs[junc_id] = {
                         'main': _get_vehicle_features(controlled['main'], device) if controlled['main'] else None,
                         'ramp': _get_vehicle_features(controlled['ramp'], device) if controlled['ramp'] else None,
                         'diverge': _get_vehicle_features(controlled['diverge'], device) if controlled['diverge'] else None
                     }
+
+                    # 调试：打印第一次的观察信息
+                    if step_count == 0:
+                        worker_logger.info(f"[{junc_id}] 状态向量: shape={state_vec.shape}, "
+                                        f"CV: main={len(controlled['main'])}, "
+                                        f"ramp={len(controlled['ramp'])}, "
+                                        f"diverge={len(controlled['diverge'])}")
+
                 except Exception as e:
-                    worker_logger.debug(f"路口 {junc_id} 观察失败: {e}")
+                    worker_logger.error(f"路口 {junc_id} 观察失败: {e}\n{traceback.format_exc()}")
 
             if not obs_tensors:
-                worker_logger.warning("没有有效的观察，跳过此步")
+                worker_logger.error(f"没有有效的观察，obs_tensors为空！已运行{step_count}步")
                 break
+
+            # 检查vehicle_obs是否也有效
+            if not any(vehicle_obs.values()):
+                worker_logger.error(f"没有有效的车辆观察！已运行{step_count}步")
+                # 不要break，继续尝试
 
             # 获取动作
             try:
@@ -655,20 +850,83 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
 
             # 转换动作
             action_dict = {}
+            total_controlled = 0
+            sample_actions = {}  # 收集第一个路口的动作值用于调试
+
             for junc_id, action in actions.items():
                 action_dict[junc_id] = {}
                 try:
-                    controlled = env.agents[junc_id].get_controlled_vehicles()
+                    # ✅ 使用全局CV分配（控制所有车道上的CV车辆）
+                    controlled = env.get_controlled_vehicles_for_junction(junc_id)
 
+                    # ✅ 控制所有可用的CV车辆（原来只控制1辆）
                     if controlled['main'] and 'main' in action:
-                        for veh_id in controlled['main'][:1]:
-                            action_dict[junc_id][veh_id] = action['main'].item()
+                        main_action_val = action['main'].item()
+                        for veh_id in controlled['main']:  # 移除[:1]限制
+                            action_dict[junc_id][veh_id] = main_action_val
+                            total_controlled += 1
+
+                        # 收集第一个路口的主路动作用于调试
+                        if junc_id not in sample_actions:
+                            sample_actions[junc_id] = {}
+                            sample_actions[junc_id]['main_action'] = main_action_val
+                            sample_actions[junc_id]['main_count'] = len(controlled['main'])
 
                     if controlled['ramp'] and 'ramp' in action:
-                        for veh_id in controlled['ramp'][:1]:
-                            action_dict[junc_id][veh_id] = action['ramp'].item()
+                        ramp_action_val = action['ramp'].item()
+                        for veh_id in controlled['ramp']:  # 移除[:1]限制
+                            action_dict[junc_id][veh_id] = ramp_action_val
+                            total_controlled += 1
+
+                        # 收集第一个路口的匝道动作用于调试
+                        if junc_id not in sample_actions:
+                            sample_actions[junc_id] = {}
+                        sample_actions[junc_id]['ramp_action'] = ramp_action_val
+                        sample_actions[junc_id]['ramp_count'] = len(controlled['ramp'])
+
+                    if controlled.get('diverge') and 'diverge' in action:
+                        diverge_action_val = action['diverge'].item()
+                        for veh_id in controlled['diverge']:  # 移除[:1]限制
+                            action_dict[junc_id][veh_id] = diverge_action_val
+                            total_controlled += 1
+
+                        if junc_id not in sample_actions:
+                            sample_actions[junc_id] = {}
+                        sample_actions[junc_id]['diverge_action'] = diverge_action_val
+                        sample_actions[junc_id]['diverge_count'] = len(controlled['diverge'])
+
                 except Exception as e:
                     worker_logger.debug(f"路口 {junc_id} 动作转换失败: {e}")
+
+            # 调试：每100步打印一次控制统计和动作值
+            if step_count % 100 == 0 and total_controlled > 0:
+                # 计算全局CV统计和各路口分配
+                total_cv_count = len(env._global_cv_assignment)
+
+                # 统计每个路口的车辆分布
+                junction_stats = {}
+                for veh_id, junc_id in env._global_cv_assignment.items():
+                    if junc_id not in junction_stats:
+                        junction_stats[junc_id] = 0
+                    junction_stats[junc_id] += 1
+
+                # 获取第一个路口的动作值
+                first_junc = next(iter(sample_actions.keys())) if sample_actions else None
+                if first_junc:
+                    info = sample_actions[first_junc]
+                    action_str = f"main={info.get('main_action', 0):.3f} ({info.get('main_count', 0)}辆)"
+                    if 'ramp_action' in info:
+                        action_str += f", ramp={info['ramp_action']:.3f} ({info.get('ramp_count', 0)}辆)"
+                    if 'diverge_action' in info:
+                        action_str += f", diverge={info['diverge_action']:.3f} ({info.get('diverge_count', 0)}辆)"
+
+                    # 构建路口分配字符串
+                    junc_str = ", ".join([f"{j}={junction_stats[j]}" for j in sorted(junction_stats.keys())])
+
+                    worker_logger.info(f"全局CV: {total_cv_count}辆 | 分配: [{junc_str}] | {first_junc} 动作: {action_str}")
+                else:
+                    junc_str = ", ".join([f"{j}={junction_stats[j]}" for j in sorted(junction_stats.keys())])
+                    worker_logger.info(f"全局CV: {total_cv_count}辆 | 分配: [{junc_str}] | 模型控制: {total_controlled}辆")
 
             # 执行动作
             try:
@@ -682,6 +940,8 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
             if step_count == 0:
                 worker_logger.info(f"rewards字典键: {list(rewards.keys())}")
                 worker_logger.info(f"env.agents字典键: {list(env.agents.keys())}")
+                worker_logger.info(f"obs_tensors字典键: {list(obs_tensors.keys())}")
+                worker_logger.info(f"vehicle_obs字典键: {list(vehicle_obs.keys())}")
 
             for junc_id in env.agents.keys():
                 try:
@@ -693,6 +953,14 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
 
                     value = values.get(junc_id, torch.tensor(0.0))
                     log_prob = _compute_log_prob(info.get(junc_id, {}), actions.get(junc_id, {}))
+
+                    # 检查obs_tensors和vehicle_obs是否包含该路口
+                    if junc_id not in obs_tensors:
+                        worker_logger.error(f"路口 {junc_id} 不在 obs_tensors 中！跳过经验存储")
+                        continue
+                    if junc_id not in vehicle_obs:
+                        worker_logger.error(f"路口 {junc_id} 不在 vehicle_obs 中！跳过经验存储")
+                        continue
 
                     experiences.append({
                         'junction_id': junc_id,
@@ -708,8 +976,16 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
                     if junc_id not in total_rewards:
                         total_rewards[junc_id] = 0.0
                     total_rewards[junc_id] += reward
+
+                    if step_count == 0:
+                        worker_logger.info(f"路口 {junc_id} 经验已添加，当前experiences长度: {len(experiences)}")
+
                 except Exception as e:
-                    worker_logger.debug(f"存储路口 {junc_id} 经验失败: {e}")
+                    worker_logger.error(f"存储路口 {junc_id} 经验失败: {e}\n{traceback.format_exc()}")
+
+            # 调试：每100步打印一次experiences长度
+            if step_count % 100 == 0:
+                worker_logger.info(f"步数 {step_count}, 已收集 {len(experiences)} 条经验")
 
             obs = next_obs
             step_count += 1
@@ -1184,7 +1460,7 @@ def main():
     parser.add_argument('--sumo-cfg', type=str, required=True, help='SUMO配置文件')
     parser.add_argument('--total-timesteps', type=int, default=1000000, help='总训练步数')
     parser.add_argument('--lr', type=float, default=3e-4, help='学习率')
-    parser.add_argument('--batch-size', type=int, default=4096, help='批大小')
+    parser.add_argument('--batch-size', type=int, default=2048, help='批大小')
     parser.add_argument('--workers', type=int, help='工作进程数（默认=CPU核心数，每个进程=1个并行环境）')
     parser.add_argument('--update-frequency', type=int, default=2048, help='更新频率')
     parser.add_argument('--save-dir', type=str, default='checkpoints', help='保存目录')

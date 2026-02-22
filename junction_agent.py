@@ -992,13 +992,19 @@ class JunctionAgent:
             return 4
     
     def get_controlled_vehicles(self) -> Dict[str, List[str]]:
+        """
+        获取该路口控制的所有CV车辆
+
+        修复：控制所有车道上的CV车辆，而不是只控制路口附近的车辆
+        """
         if self.current_state is None:
             return {'main': [], 'ramp': [], 'diverge': []}
-        
+
+        # ✅ 返回所有监听到的CV车辆（移除数量限制）
         return {
-            'main': self.current_state.cv_vehicles_main[:5],
-            'ramp': self.current_state.cv_vehicles_ramp[:3],
-            'diverge': self.current_state.cv_vehicles_diverge[:2] if self.junction_type == JunctionType.TYPE_B else []
+            'main': self.current_state.cv_vehicles_main,  # 移除[:5]限制
+            'ramp': self.current_state.cv_vehicles_ramp,  # 移除[:3]限制
+            'diverge': self.current_state.cv_vehicles_diverge if self.junction_type == JunctionType.TYPE_B else []
         }
 
 
@@ -1011,44 +1017,47 @@ class MultiAgentEnvironment:
         self.sumo_cfg = sumo_cfg
         self.use_gui = use_gui
         self.seed = seed
-        
+
         self.sub_manager = SubscriptionManager()
-        
+
         self.agents: Dict[str, JunctionAgent] = {}
         for junc_id in self.junction_ids:
             if junc_id in JUNCTION_CONFIGS:
                 self.agents[junc_id] = JunctionAgent(
-                    JUNCTION_CONFIGS[junc_id], 
+                    JUNCTION_CONFIGS[junc_id],
                     self.sub_manager
                 )
-        
+
         self.current_step = 0
         self.is_running = False
-        
+
         self.global_stats = {
             'total_ocr': 0.0,
             'total_throughput': 0,
             'total_waiting': 0
         }
+
+        # ✅ 全局CV车辆分配缓存（确保每个CV只被一个路口控制）
+        self._global_cv_assignment: Dict[str, str] = {}  # {veh_id: junction_id}
     
     def reset(self) -> Dict[str, np.ndarray]:
-        """重置环境"""
+        """重置环境，返回状态向量"""
         self._start_sumo()
-        
+
         self.current_step = 0
-        
+
         self._setup_all_subscriptions()
-        
+
         for _ in range(10):
             traci.simulationStep()
             self.current_step += 1
             self._update_subscriptions()
-        
+
         observations = {}
         for junc_id, agent in self.agents.items():
             state = agent.observe()
-            observations[junc_id] = agent.get_state_vector(state)
-        
+            observations[junc_id] = agent.get_state_vector(state)  # ✅ 返回向量，不是 JunctionState
+
         return observations
     
     def _setup_all_subscriptions(self):
@@ -1068,12 +1077,249 @@ class MultiAgentEnvironment:
     def _update_subscriptions(self):
         """更新订阅"""
         self.sub_manager.update_results()
-        
+
         current_vehicles = set(traci.vehicle.getIDList())
-        
+
         new_vehicles = current_vehicles - self.sub_manager.subscribed_vehicles
         if new_vehicles:
             self.sub_manager.setup_vehicle_subscription(list(new_vehicles))
+
+        # ✅ 更新全局CV车辆分配
+        self._assign_all_cv_vehicles()
+
+    def _assign_all_cv_vehicles(self):
+        """
+        全局分配所有CV车辆给各个路口
+
+        核心原则：
+        对路口交通流有影响的是其上游到上一个路口前的车道
+
+        分配策略（基于road_topology_hardcoded.py）：
+        - J5: 控制 E2 + E23 + -E3（会到达或影响J5的边）
+        - J14: 控制 E9 + E15 + -E10
+        - J15: 控制 E10 + E17 + -E11 + E16
+        - J17: 控制 E12 + E19 + -E13 + E18 + E20
+        """
+        try:
+            from road_topology_hardcoded import JUNCTION_CONFIG, EDGE_TOPOLOGY
+
+            # 获取所有CV车辆
+            all_cv_vehicles = []
+            for veh_id in traci.vehicle.getIDList():
+                try:
+                    if traci.vehicle.getTypeID(veh_id) == 'CV':
+                        all_cv_vehicles.append(veh_id)
+                except:
+                    continue
+
+            # 清空之前的分配
+            self._global_cv_assignment.clear()
+
+            # 为每个CV车辆分配路口
+            for veh_id in all_cv_vehicles:
+                try:
+                    current_edge = traci.vehicle.getRoadID(veh_id)
+
+                    # 根据车辆所在边，分配给对应的路口
+                    # 原则：如果车辆在某个路口的"影响范围"内，就分配给该路口
+
+                    assigned_junction = None
+
+                    # J5的影响范围：E2(主路上游) + E23(匝道) + -E3(反向冲突)
+                    if current_edge in ['E2', 'E23', '-E3']:
+                        assigned_junction = 'J5'
+
+                    # J14的影响范围：E9(主路上游) + E15(匝道) + -E10(反向冲突)
+                    elif current_edge in ['E9', 'E15', '-E10']:
+                        assigned_junction = 'J14'
+
+                    # J15的影响范围：E10(主路上游) + E17(匝道) + -E11(反向冲突) + E16(转出)
+                    elif current_edge in ['E10', 'E17', '-E11', 'E16']:
+                        assigned_junction = 'J15'
+
+                    # J17的影响范围：E12(主路上游) + E19(匝道) + -E13(反向冲突) + E18/E20(转出)
+                    elif current_edge in ['E12', 'E19', '-E13', 'E18', 'E20']:
+                        assigned_junction = 'J17'
+
+                    # 如果车辆不在任何路口的直接影响范围内，根据拓扑关系分配
+                    if assigned_junction is None:
+                        # 查找这条边的下游路口
+                        if current_edge in EDGE_TOPOLOGY:
+                            edge_info = EDGE_TOPOLOGY[current_edge]
+                            # 检查下游边
+                            for downstream_edge in edge_info.downstream:
+                                # 递归检查下游边属于哪个路口
+                                for junc_id, junc_config in JUNCTION_CONFIG.items():
+                                    affected_edges = (
+                                        junc_config['main_incoming'] +
+                                        junc_config.get('ramp_incoming', []) +
+                                        junc_config.get('main_reverse', []) +
+                                        junc_config.get('ramp_outgoing', [])
+                                    )
+                                    if downstream_edge in affected_edges:
+                                        assigned_junction = junc_id
+                                        break
+                                if assigned_junction:
+                                    break
+
+                    # 如果还是找不到，使用默认分配策略
+                    if assigned_junction is None:
+                        # 正向边E1-E24：根据下游路口分配
+                        if current_edge.startswith('E') and not current_edge.startswith('-E'):
+                            if 'E1' <= current_edge <= 'E9':
+                                assigned_junction = 'J14'  # 下游是J14
+                            elif 'E10' <= current_edge <= 'E13':
+                                assigned_junction = 'J15'  # 下游是J15
+                            else:
+                                assigned_junction = 'J14'
+                        # 反向边-E1--E24
+                        elif current_edge.startswith('-E'):
+                            if '-E1' <= current_edge <= '-E3':
+                                assigned_junction = 'J5'
+                            elif '-E4' <= current_edge <= '-E11':
+                                assigned_junction = 'J15'
+                            elif '-E12' <= current_edge <= '-E13':
+                                assigned_junction = 'J17'
+                            else:
+                                assigned_junction = 'J5'
+                        else:
+                            # 匝道边，根据其下游主路分配
+                            assigned_junction = self.junction_ids[0] if self.junction_ids else 'J14'
+
+                    self._global_cv_assignment[veh_id] = assigned_junction
+
+                except Exception as e:
+                    # 如果分配失败，默认分配给第一个路口
+                    default_junction = self.junction_ids[0] if self.junction_ids else 'J14'
+                    self._global_cv_assignment[veh_id] = default_junction
+
+            # 调试：第一次分配时打印详细统计
+            if not hasattr(self, '_cv_assignment_printed'):
+                self._cv_assignment_printed = True
+
+                # 统计每个路口的车辆分布
+                junction_stats = {}
+                edge_distribution = {}  # {edge_id: count}
+
+                for veh_id, junc_id in self._global_cv_assignment.items():
+                    if junc_id not in junction_stats:
+                        junction_stats[junc_id] = 0
+                    junction_stats[junc_id] += 1
+
+                    # 统计边分布
+                    try:
+                        edge = traci.vehicle.getRoadID(veh_id)
+                        edge_key = f"{edge}→{junc_id}"
+                        edge_distribution[edge_key] = edge_distribution.get(edge_key, 0) + 1
+                    except:
+                        pass
+
+                print(f"\n{'='*70}")
+                print(f"CV车辆分配统计（基于road_topology_hardcoded.py）")
+                print(f"{'='*70}")
+                print(f"总CV车辆数: {len(all_cv_vehicles)}")
+                print(f"\n路口分配:")
+                for junc_id in sorted(junction_stats.keys()):
+                    print(f"  {junc_id}: {junction_stats[junc_id]}辆")
+
+                print(f"\n边→路口映射（前20条）:")
+                for i, (edge_key, count) in enumerate(sorted(edge_distribution.items())[:20]):
+                    print(f"  {edge_key}: {count}辆")
+                print(f"{'='*70}\n")
+
+        except Exception as e:
+            print(f"[警告] 全局CV车辆分配失败: {e}")
+
+    def get_controlled_vehicles_for_junction(self, junc_id: str) -> Dict[str, List[str]]:
+        """
+        获取指定路口控制的所有CV车辆
+
+        基于road_topology_hardcoded.py的拓扑关系分类车辆
+
+        Args:
+            junc_id: 路口ID
+
+        Returns:
+            {'main': [...], 'ramp': [...], 'diverge': [...]}
+        """
+        if junc_id not in self.agents:
+            return {'main': [], 'ramp': [], 'diverge': []}
+
+        agent = self.agents[junc_id]
+        config = agent.config
+
+        # 获取分配给这个路口的所有CV车辆
+        assigned_cvs = [
+            veh_id for veh_id, assigned_junc in self._global_cv_assignment.items()
+            if assigned_junc == junc_id
+        ]
+
+        # 从road_topology_hardcoded导入拓扑信息
+        try:
+            from road_topology_hardcoded import JUNCTION_CONFIG, EDGE_TOPOLOGY
+            junc_topology = JUNCTION_CONFIG.get(junc_id, {})
+        except:
+            junc_topology = {}
+
+        # 根据车辆所在的边，分类到main/ramp/diverge
+        main_cvs = []
+        ramp_cvs = []
+        diverge_cvs = []
+
+        for veh_id in assigned_cvs:
+            try:
+                current_edge = traci.vehicle.getRoadID(veh_id)
+
+                # 使用拓扑信息判断车辆类型
+                if junc_topology:
+                    # 主路上游车辆
+                    if current_edge in junc_topology.get('main_incoming', []):
+                        main_cvs.append(veh_id)
+                    # 匝道上游车辆
+                    elif current_edge in junc_topology.get('ramp_incoming', []):
+                        ramp_cvs.append(veh_id)
+                    # 转出匝道车辆
+                    elif current_edge in junc_topology.get('ramp_outgoing', []):
+                        diverge_cvs.append(veh_id)
+                    # 反向主路车辆（会与匝道汇入冲突）
+                    elif current_edge in junc_topology.get('main_reverse', []):
+                        main_cvs.append(veh_id)
+                    else:
+                        # 使用EDGE_TOPOLOGY判断
+                        if current_edge in EDGE_TOPOLOGY:
+                            edge_info = EDGE_TOPOLOGY[current_edge]
+                            if edge_info.is_ramp:
+                                # 判断是汇入匝道还是转出匝道
+                                if agent.junction_type == JunctionType.TYPE_B:
+                                    # 复杂路口，需要区分
+                                    if current_edge in ['E16', 'E18', 'E20']:
+                                        diverge_cvs.append(veh_id)
+                                    else:
+                                        ramp_cvs.append(veh_id)
+                                else:
+                                    ramp_cvs.append(veh_id)
+                            else:
+                                main_cvs.append(veh_id)
+                        else:
+                            main_cvs.append(veh_id)
+                else:
+                    # 回退到旧逻辑
+                    if current_edge in config.ramp_incoming or current_edge in config.ramp_outgoing:
+                        ramp_cvs.append(veh_id)
+                    elif agent.junction_type == JunctionType.TYPE_B and \
+                         (current_edge in config.ramp_outgoing or \
+                          any(edge in current_edge for edge in ['E16', 'E18', 'E20'])):
+                        diverge_cvs.append(veh_id)
+                    else:
+                        main_cvs.append(veh_id)
+            except Exception:
+                main_cvs.append(veh_id)
+
+        return {
+            'main': main_cvs,
+            'ramp': ramp_cvs,
+            'diverge': diverge_cvs if agent.junction_type == JunctionType.TYPE_B else []
+        }
     
     def step(self, actions: Dict[str, Dict]) -> Tuple[Dict[str, np.ndarray], Dict[str, float], bool, Dict]:
         """执行一步"""
@@ -1084,8 +1330,8 @@ class MultiAgentEnvironment:
 
         self._update_subscriptions()
 
-        # === 应用主动速度控制（每一步都执行）===
-        self._active_cv_control()
+        # ❌ 移除主动控制，让RL模型完全接管
+        # self._active_cv_control()
 
         observations = {}
         for junc_id, agent in self.agents.items():
