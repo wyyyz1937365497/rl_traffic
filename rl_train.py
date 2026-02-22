@@ -30,9 +30,16 @@ import subprocess
 import threading
 import traceback as tb
 
-from junction_agent import JUNCTION_CONFIGS
+from junction_agent import JunctionAgent
+from road_topology_hardcoded import (
+    JUNCTION_CONFIG,
+    get_junction_main_edges,
+    get_junction_ramp_edges,
+    get_junction_edges,
+    create_junction_config_from_dict
+)
 
-from junction_network import create_junction_model, NetworkConfig
+from junction_network import create_vehicle_level_model, NetworkConfig
 from junction_trainer import PPOConfig, MultiAgentPPOTrainer
 
 # 直接使用 libsumo（参考 fast_pkl_generator.py）
@@ -140,9 +147,11 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
             self._global_cv_assignment: Dict[str, str] = {}  # {veh_id: junction_id}
 
             try:
-                for junc_id in JUNCTION_CONFIGS.keys():
+                for junc_id in JUNCTION_CONFIG.keys():
+                    # 从简化的字典配置创建完整的 JunctionConfig 对象
+                    full_config = create_junction_config_from_dict(junc_id, JUNCTION_CONFIG[junc_id])
                     self.agents[junc_id] = JunctionAgent(
-                        JUNCTION_CONFIGS[junc_id],
+                        full_config,
                         self.sub_manager
                     )
                 self.logger.info(f"Environment初始化完成（订阅模式），种子={seed}")
@@ -257,13 +266,8 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                             if current_edge in EDGE_TOPOLOGY:
                                 edge_info = EDGE_TOPOLOGY[current_edge]
                                 for downstream_edge in edge_info.downstream:
-                                    for junc_id, junc_config in JUNCTION_CONFIG.items():
-                                        affected_edges = (
-                                            junc_config['main_incoming'] +
-                                            junc_config.get('ramp_incoming', []) +
-                                            junc_config.get('main_reverse', []) +
-                                            junc_config.get('ramp_outgoing', [])
-                                        )
+                                    for junc_id in JUNCTION_CONFIG.keys():
+                                        affected_edges = get_junction_edges(junc_id)
                                         if downstream_edge in affected_edges:
                                             assigned_junction = junc_id
                                             break
@@ -322,20 +326,23 @@ def create_libsumo_environment(sumo_cfg: str, seed: int = 42):
                 if assigned_junc == junc_id
             ]
 
-            # 根据车辆所在的边，分类到main/ramp/diverge
+            # 根据车辆所在的边，分类到main/ramp/diverge（使用简化的配置）
             main_cvs = []
             ramp_cvs = []
             diverge_cvs = []
+
+            # 使用辅助函数获取各类边
+            ramp_edges = get_junction_ramp_edges(junc_id)
+            main_edges = get_junction_main_edges(junc_id)
 
             for veh_id in assigned_cvs:
                 try:
                     current_edge = traci.vehicle.getRoadID(veh_id)
 
-                    if current_edge in config.ramp_incoming or current_edge in config.ramp_outgoing:
+                    if current_edge in ramp_edges:
                         ramp_cvs.append(veh_id)
                     elif agent.junction_type == junction_agent.JunctionType.TYPE_B and \
-                         (current_edge in config.ramp_outgoing or \
-                          any(edge in current_edge for edge in ['E16', 'E18', 'E20'])):
+                         (current_edge in ['E16', 'E18', 'E20']):
                         diverge_cvs.append(veh_id)
                     else:
                         main_cvs.append(veh_id)
@@ -793,7 +800,7 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
         worker_logger.info("环境创建成功")
 
         # 创建模型
-        model = create_junction_model(JUNCTION_CONFIGS)
+        model = create_vehicle_level_model(JUNCTION_CONFIG)
         model.load_state_dict(model_state)
         model.to(device)
         model.eval()
@@ -851,7 +858,7 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
                 worker_logger.error(f"模型推理失败: {e}")
                 break
 
-            # 转换动作
+            # 转换动作（车辆级控制）
             action_dict = {}
             total_controlled = 0
             sample_actions = {}  # 收集第一个路口的动作值用于调试
@@ -862,41 +869,44 @@ def worker_process(worker_id, sumo_cfg, output_dir, seed, model_state, use_cuda)
                     # ✅ 使用全局CV分配（控制所有车道上的CV车辆）
                     controlled = env.get_controlled_vehicles_for_junction(junc_id)
 
-                    # ✅ 控制所有可用的CV车辆（原来只控制1辆）
-                    if controlled['main'] and 'main' in action:
-                        main_action_val = action['main'].item()
-                        for veh_id in controlled['main']:  # 移除[:1]限制
-                            action_dict[junc_id][veh_id] = main_action_val
+                    # ✅ 车辆级控制：为每辆车分配独立动作
+                    if controlled['main'] and 'main_actions' in action:
+                        main_actions = action['main_actions']  # [batch, num_main]
+                        num_main = min(len(controlled['main']), main_actions.size(1))
+                        for i, veh_id in enumerate(controlled['main'][:num_main]):
+                            action_dict[junc_id][veh_id] = main_actions[0, i].item()
                             total_controlled += 1
 
                         # 收集第一个路口的主路动作用于调试
-                        if junc_id not in sample_actions:
+                        if junc_id not in sample_actions and num_main > 0:
                             sample_actions[junc_id] = {}
-                            sample_actions[junc_id]['main_action'] = main_action_val
-                            sample_actions[junc_id]['main_count'] = len(controlled['main'])
+                            sample_actions[junc_id]['main_actions'] = main_actions[0, :num_main].tolist()
+                            sample_actions[junc_id]['main_count'] = num_main
 
-                    if controlled['ramp'] and 'ramp' in action:
-                        ramp_action_val = action['ramp'].item()
-                        for veh_id in controlled['ramp']:  # 移除[:1]限制
-                            action_dict[junc_id][veh_id] = ramp_action_val
+                    if controlled['ramp'] and 'ramp_actions' in action:
+                        ramp_actions = action['ramp_actions']  # [batch, num_ramp]
+                        num_ramp = min(len(controlled['ramp']), ramp_actions.size(1))
+                        for i, veh_id in enumerate(controlled['ramp'][:num_ramp]):
+                            action_dict[junc_id][veh_id] = ramp_actions[0, i].item()
                             total_controlled += 1
 
                         # 收集第一个路口的匝道动作用于调试
-                        if junc_id not in sample_actions:
+                        if junc_id not in sample_actions and num_ramp > 0:
                             sample_actions[junc_id] = {}
-                        sample_actions[junc_id]['ramp_action'] = ramp_action_val
-                        sample_actions[junc_id]['ramp_count'] = len(controlled['ramp'])
+                            sample_actions[junc_id]['ramp_actions'] = ramp_actions[0, :num_ramp].tolist()
+                            sample_actions[junc_id]['ramp_count'] = num_ramp
 
-                    if controlled.get('diverge') and 'diverge' in action:
-                        diverge_action_val = action['diverge'].item()
-                        for veh_id in controlled['diverge']:  # 移除[:1]限制
-                            action_dict[junc_id][veh_id] = diverge_action_val
+                    if controlled.get('diverge') and 'diverge_actions' in action:
+                        diverge_actions = action['diverge_actions']  # [batch, num_diverge]
+                        num_diverge = min(len(controlled['diverge']), diverge_actions.size(1))
+                        for i, veh_id in enumerate(controlled['diverge'][:num_diverge]):
+                            action_dict[junc_id][veh_id] = diverge_actions[0, i].item()
                             total_controlled += 1
 
-                        if junc_id not in sample_actions:
+                        if junc_id not in sample_actions and num_diverge > 0:
                             sample_actions[junc_id] = {}
-                        sample_actions[junc_id]['diverge_action'] = diverge_action_val
-                        sample_actions[junc_id]['diverge_count'] = len(controlled['diverge'])
+                            sample_actions[junc_id]['diverge_actions'] = diverge_actions[0, :num_diverge].tolist()
+                            sample_actions[junc_id]['diverge_count'] = num_diverge
 
                 except Exception as e:
                     worker_logger.debug(f"路口 {junc_id} 动作转换失败: {e}")
@@ -1150,7 +1160,7 @@ def train(args):
     print(f"  日志保存: {log_dir}")
 
     # 创建模型
-    model = create_junction_model(JUNCTION_CONFIGS, net_config)
+    model = create_vehicle_level_model(JUNCTION_CONFIG, net_config)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model.to(device)
 
@@ -1386,8 +1396,8 @@ def train(args):
                 min_ocr = np.min(worker_ocrs)
                 max_ocr = np.max(worker_ocrs)
                 tqdm.write(f"  - 平均OCR: {mean_ocr:.4f} ± {std_ocr:.4f} (范围: {min_ocr:.4f} - {max_ocr:.4f})")
-                # 使用实际的baseline OCR进行评分
-                baseline_ocr = self.reward_calculator.get_final_baseline_ocr()
+                # 使用固定的baseline OCR进行评分（0.94）
+                baseline_ocr = 0.94
                 score_estimate = (mean_ocr - baseline_ocr) / baseline_ocr * 100
                 tqdm.write(f"  - 得分预估: {score_estimate:.2f} (基准OCR={baseline_ocr:.4f})")
 
@@ -1459,8 +1469,8 @@ def train(args):
             print(f"  最终OCR: {iteration_ocr_history[-1]:.4f}")
             print(f"  最佳OCR: {best_ocr:.4f}")
             print(f"  平均OCR: {np.mean(iteration_ocr_history):.4f} ± {np.std(iteration_ocr_history):.4f}")
-            # 使用实际的baseline OCR进行评分
-            baseline_ocr = self.reward_calculator.get_final_baseline_ocr()
+            # 使用固定的baseline OCR进行评分（0.94）
+            baseline_ocr = 0.94
             print(f"\n得分预估 (基准OCR={baseline_ocr:.4f}):")
             print(f"  初始得分: {(iteration_ocr_history[0] - baseline_ocr) / baseline_ocr * 100:.2f}")
             print(f"  最终得分: {(iteration_ocr_history[-1] - baseline_ocr) / baseline_ocr * 100:.2f}")

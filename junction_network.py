@@ -701,5 +701,97 @@ class MultiJunctionModel(nn.Module):
 
 
 def create_junction_model(junction_configs: Dict, config: NetworkConfig = None) -> MultiJunctionModel:
-    """创建多路口模型"""
+    """创建多路口模型（旧版：路口级控制）"""
     return MultiJunctionModel(junction_configs, config)
+
+
+# ============================================================================
+# 车辆级控制模型（新版）
+# ============================================================================
+
+class VehicleLevelMultiJunctionModel(nn.Module):
+    """
+    车辆级控制的多路口模型
+    为每辆CV车辆输出独立的连续动作
+    """
+
+    def __init__(self, junction_configs: Dict, config: NetworkConfig = None):
+        super().__init__()
+
+        if config is None:
+            config = NetworkConfig()
+
+        self.config = config
+        self.junction_configs = junction_configs
+
+        # 为每个路口创建车辆级控制器
+        from vehicle_level_network import VehicleLevelJunctionNetwork
+        self.networks = nn.ModuleDict({
+            junc_id: VehicleLevelJunctionNetwork(
+                state_dim=23,
+                vehicle_feat_dim=8,
+                hidden_dim=config.gnn_hidden_dim if hasattr(config, 'gnn_hidden_dim') else 64
+            )
+            for junc_id in junction_configs.keys()
+        })
+
+        # 路口间协调器（可选）
+        self.coordinator = InterJunctionCoordinator()
+
+        # 全局价值网络
+        self.global_value = nn.Sequential(
+            nn.Linear(64 * len(junction_configs), 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, observations: Dict[str, torch.Tensor],
+                vehicle_observations: Dict[str, Dict[str, torch.Tensor]] = None,
+                deterministic: bool = False) -> Tuple[Dict[str, Dict], Dict[str, torch.Tensor], Dict]:
+        """
+        前向传播（车辆级控制）
+
+        Args:
+            observations: {路口ID: [batch, state_dim]}
+            vehicle_observations: {路口ID: {'main': [batch, N, 8], 'ramp': [batch, M, 8], 'diverge': [...]}}
+            deterministic: 是否确定性策略
+
+        Returns:
+            all_actions: {路口ID: {'main_actions': [batch, N], 'ramp_actions': [batch, M], ...}}
+            all_values: {路口ID: [batch, 1]}
+            all_info: 额外信息
+        """
+        all_actions = {}
+        all_values = {}
+        all_info = {}
+
+        for junc_id, state in observations.items():
+            # 获取车辆观察
+            veh_obs = vehicle_observations.get(junc_id, {}) if vehicle_observations else {}
+            main_veh = veh_obs.get('main')
+            ramp_veh = veh_obs.get('ramp')
+            diverge_veh = veh_obs.get('diverge')
+
+            # 调用车辆级网络
+            network = self.networks[junc_id]
+            output = network(state, main_veh, ramp_veh, diverge_veh)
+
+            # 转换输出格式
+            actions = {}
+            if output['main_actions'] is not None:
+                actions['main_actions'] = output['main_actions']
+            if output['ramp_actions'] is not None:
+                actions['ramp_actions'] = output['ramp_actions']
+            if output['diverge_actions'] is not None:
+                actions['diverge_actions'] = output['diverge_actions']
+
+            all_actions[junc_id] = actions
+            all_values[junc_id] = output['value']
+            all_info[junc_id] = {}
+
+        return all_actions, all_values, all_info
+
+
+def create_vehicle_level_model(junction_configs: Dict, config: NetworkConfig = None) -> VehicleLevelMultiJunctionModel:
+    """创建车辆级控制模型（新版）"""
+    return VehicleLevelMultiJunctionModel(junction_configs, config)

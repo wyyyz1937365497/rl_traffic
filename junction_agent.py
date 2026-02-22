@@ -193,158 +193,31 @@ class JunctionState:
 
 
 # ============================================================================
-# 交叉口配置（基于硬编码拓扑和车道级冲突矩阵）
+# 交叉口配置（从 road_topology_hardcoded.py 动态生成）
 # ============================================================================
-# 数据来源：road_topology_hardcoded.py
-# - EDGE_TOPOLOGY: 完整边拓扑关系
-# - LANE_CONFLICTS: 车道级冲突矩阵
-# ============================================================================
-
-# ============================================================================
-# 交叉口配置（基于 EDGE_TOPOLOGY 的实际上下游关系）
-# ============================================================================
-# 关键理解：
-# - incoming: 进入路口的边（上游）
-# - outgoing: 离开路口的边（下游）
-# - ramp汇入点: 匝道下游边（汇入到该边）
-# - 冲突边: 在汇入点与匝道车辆冲突的主路方向
+# 为了向后兼容，保留 JUNCTION_CONFIGS 变量
+# 现在从 road_topology_hardcoded.py 的简化配置动态生成完整的 JunctionConfig
 # ============================================================================
 
-JUNCTION_CONFIGS = {
-    # ==================== J5: E23匝道汇入 ====================
-    # 拓扑（来自 EDGE_TOPOLOGY）：
-    #   E2 → E3 (正向主路过J5)
-    #   -E3 → -E2 (反向主路过J5)
-    #   E23 → -E2 (匝道汇入到 -E2)
-    #
-    # 冲突分析：
-    #   E23 汇入到 -E2，与从 -E3 来的车辆在 -E2 上冲突
-    #   汇入点在 J5 路口，冲突边是 -E3（上游来车方向）
-    #   LANE_CONFLICTS: 'E23_0': ['-E3_0'] (与注释说"外侧2条"，但实际只列1条)
-    'J5': JunctionConfig(
-        junction_id='J5',
-        junction_type=JunctionType.TYPE_A,
-        # 主路配置
-        main_incoming=['E2'],      # 正向主路上游
-        main_outgoing=['E3'],      # 正向主路下游
-        reverse_incoming=['-E3'],  # 反向主路上游（与匝道冲突的方向）
-        reverse_outgoing=['-E2'],  # 反向主路下游（匝道汇入边）
-        # 匝道配置
-        ramp_incoming=['E23'],     # 匝道上游（1车道）
-        ramp_outgoing=[],          # 无转出匝道
-        # 信号灯配置
-        has_traffic_light=True,
-        tl_id='J5',
-        num_phases=2,
-        # 车道级冲突信息
-        num_main_lanes=2,          # E2有2车道
-        num_ramp_lanes=1,          # E23有1车道
-        conflict_lanes=['-E3_0']   # 与反向主路上游来车冲突（LANE_CONFLICTS定义）
-    ),
+def _build_junction_configs_from_topology():
+    """从 road_topology_hardcoded.py 动态构建 JUNCTION_CONFIGS"""
+    try:
+        from road_topology_hardcoded import (
+            JUNCTION_CONFIG,
+            create_junction_config_from_dict
+        )
+        # 使用转换函数从简化配置生成完整的 JunctionConfig 对象
+        return {
+            junc_id: create_junction_config_from_dict(junc_id, config_dict)
+            for junc_id, config_dict in JUNCTION_CONFIG.items()
+        }
+    except ImportError:
+        # 如果导入失败，返回空字典（向后兼容）
+        print("警告：无法从 road_topology_hardcoded.py 导入配置，JUNCTION_CONFIGS 将为空")
+        return {}
 
-    # ==================== J14: E15匝道汇入 ====================
-    # 拓扑（来自 EDGE_TOPOLOGY）：
-    #   E9 → E10 (正向主路过J14)
-    #   -E10 → -E9 (反向主路过J14)
-    #   E15 → E10 (匝道汇入到 E10)
-    #
-    # 冲突分析：
-    #   E9 来车过 J14 到 E10
-    #   E15 匝道也汇入到 E10
-    #   两股车流在 E10 上合流，产生冲突
-    #   汇入点在 J14，冲突是 E9 来车（上游）与 E15 汇入车
-    #   LANE_CONFLICTS: 'E15_0': ['E9_0']
-    'J14': JunctionConfig(
-        junction_id='J14',
-        junction_type=JunctionType.TYPE_A,
-        # 主路配置
-        main_incoming=['E9'],      # 正向主路上游（与匝道冲突的方向）
-        main_outgoing=['E10'],     # 正向主路下游（匝道汇入边）
-        reverse_incoming=['-E10'], # 反向主路上游
-        reverse_outgoing=['-E9'],  # 反向主路下游
-        # 匝道配置
-        ramp_incoming=['E15'],     # 匝道上游（1车道）
-        ramp_outgoing=[],          # 无转出匝道
-        # 信号灯配置
-        has_traffic_light=True,
-        tl_id='J14',
-        num_phases=2,
-        # 车道级冲突信息
-        num_main_lanes=2,          # E9有2车道
-        num_ramp_lanes=1,          # E15有1车道
-        conflict_lanes=['E9_0']    # 与正向主路上游来车冲突（LANE_CONFLICTS定义）
-    ),
-
-    # ==================== J15: E17匝道汇入 + E16转出 ====================
-    # 拓扑（来自 EDGE_TOPOLOGY）：
-    #   E10 → E11 (正向主路过J15)
-    #   -E11 → -E10 (反向主路过J15)
-    #   E17 → -E10 (匝道汇入到 -E10)
-    #   -E11 → E16 (从反向主路转出)
-    #
-    # 冲突分析：
-    #   -E11 来车过 J15 到 -E10
-    #   E17 匝道也汇入到 -E10
-    #   两股车流在 -E10 上合流，产生冲突
-    #   汇入点在 J15，冲突是 -E11 来车（上游）与 E17 汇入车
-    #   LANE_CONFLICTS: 'E17_0': ['-E11_0', '-E11_1'] (关键：不与-E11_2冲突)
-    'J15': JunctionConfig(
-        junction_id='J15',
-        junction_type=JunctionType.TYPE_B,  # 复杂：汇入+转出
-        # 主路配置
-        main_incoming=['E10'],     # 正向主路上游
-        main_outgoing=['E11'],     # 正向主路下游
-        reverse_incoming=['-E11'], # 反向主路上游（与匝道冲突的方向）
-        reverse_outgoing=['-E10'], # 反向主路下游（匝道汇入边）
-        # 匝道配置
-        ramp_incoming=['E17'],     # 汇入匝道（1车道）
-        ramp_outgoing=['E16'],     # 转出匝道（2车道）
-        # 信号灯配置
-        has_traffic_light=True,
-        tl_id='J15',
-        num_phases=2,
-        # 车道级冲突信息（关键：只与前2条车道冲突）
-        num_main_lanes=3,          # E10有3车道
-        num_ramp_lanes=1,          # E17有1车道
-        conflict_lanes=['-E11_0', '-E11_1']  # 与反向主路上游来车冲突（LANE_CONFLICTS定义）
-    ),
-
-    # ==================== J17: E19匝道汇入 + E18/E20转出 ====================
-    # 拓扑（来自 EDGE_TOPOLOGY）：
-    #   E12 → E13 (正向主路过J17)
-    #   -E13 → -E12 (反向主路过J17)
-    #   E19 → -E12 (匝道汇入到 -E12)
-    #   E12 → E18 (从正向主路转出)
-    #   -E13 → E20 (从反向主路转出)
-    #
-    # 冲突分析：
-    #   -E13 来车过 J17 到 -E12
-    #   E19 匝道也汇入到 -E12
-    #   两股车流在 -E12 上合流，产生冲突
-    #   汇入点在 J17，冲突是 -E13 来车（上游）与 E19 汇入车
-    #   LANE_CONFLICTS: 'E19_0': ['-E13_0', '-E13_1'], 'E19_1': ['-E13_0', '-E13_1']
-    #   关键：不与 -E13_2 冲突
-    'J17': JunctionConfig(
-        junction_id='J17',
-        junction_type=JunctionType.TYPE_B,  # 复杂：汇入+转出
-        # 主路配置
-        main_incoming=['E12'],     # 正向主路上游
-        main_outgoing=['E13'],     # 正向主路下游
-        reverse_incoming=['-E13'], # 反向主路上游（与匝道冲突的方向）
-        reverse_outgoing=['-E12'], # 反向主路下游（匝道汇入边）
-        # 匝道配置
-        ramp_incoming=['E19'],     # 汇入匝道（2车道）
-        ramp_outgoing=['E18', 'E20'],  # 转出匝道（E18: 1车道, E20: 1车道）
-        # 信号灯配置
-        has_traffic_light=True,
-        tl_id='J17',
-        num_phases=2,
-        # 车道级冲突信息（关键：只与前2条车道冲突）
-        num_main_lanes=3,          # E12有3车道
-        num_ramp_lanes=2,          # E19有2车道
-        conflict_lanes=['-E13_0', '-E13_1']  # 与反向主路上游来车冲突（LANE_CONFLICTS定义）
-    )
-}
+# 动态生成 JUNCTION_CONFIGS
+JUNCTION_CONFIGS = _build_junction_configs_from_topology()
 
 
 class SubscriptionManager:

@@ -8,6 +8,36 @@ from typing import List, Dict, Any
 import os
 
 
+def _get_default_critical_edges() -> List[str]:
+    """动态生成关键路段列表（从road_topology_hardcoded.py）"""
+    try:
+        from road_topology_hardcoded import JUNCTION_CONFIG, get_junction_ramp_edges
+        # 从所有路口配置中收集关键边
+        critical = []
+        for junc_id, config in JUNCTION_CONFIG.items():
+            # 添加所有相关边
+            critical.extend(config.get('edges', []))
+        # 去重并排序
+        return sorted(set(critical))
+    except ImportError:
+        # 如果导入失败，返回默认值
+        return [
+            'E7', 'E8', 'E9', 'E10', 'E11', 'E12',  # 主路
+            '-E10', '-E11', '-E12',  # 反向主路
+            'E15', 'E17', 'E19', 'E23',  # 匝道汇入
+        ]
+
+
+def _get_default_critical_junctions() -> List[str]:
+    """动态生成关键路口列表（从road_topology_hardcoded.py）"""
+    try:
+        from road_topology_hardcoded import JUNCTION_CONFIG
+        return sorted(JUNCTION_CONFIG.keys())
+    except ImportError:
+        # 如果导入失败，返回默认值
+        return ['J5', 'J14', 'J15', 'J17']
+
+
 @dataclass
 class NetworkConfig:
     """神经网络配置"""
@@ -98,16 +128,10 @@ class EnvironmentConfig:
     waiting_penalty: float = -0.1  # 等待惩罚
     
     # 关键路段（需要重点关注的路段）
-    critical_edges: List[str] = field(default_factory=lambda: [
-        'E7', 'E8', 'E9', 'E10', 'E11', 'E12',  # 主路
-        '-E10', '-E11', '-E12',  # 反向主路
-        'E15', 'E17', 'E19', 'E23',  # 匝道汇入
-    ])
-    
+    critical_edges: List[str] = field(default_factory=_get_default_critical_edges)
+
     # 关键交叉口
-    critical_junctions: List[str] = field(default_factory=lambda: [
-        'J5', 'J14', 'J15', 'J17'
-    ])
+    critical_junctions: List[str] = field(default_factory=_get_default_critical_junctions)
 
 
 @dataclass

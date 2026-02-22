@@ -369,70 +369,29 @@ LANE_CONFLICTS: Dict[str, List[str]] = {
 # 交叉口配置（硬编码）
 # ============================================================================
 
+# 简明配置格式：直接定义每个路口的边范围
+# 代码根据EDGE_TOPOLOGY自动判断边的类型（is_ramp, is_main）
+
 JUNCTION_CONFIG: Dict[str, Dict] = {
     'J5': {
         'type': 'simple_merge',
-        'main_incoming': ['E2'],
-        'main_outgoing': ['E3'],
-        'ramp_incoming': ['E23'],
-        'main_reverse': ['-E3'],
-        'num_main_lanes': 2,
-        'num_ramp_lanes': 1,
-        'has_traffic_light': True,
-        'conflict_edges': {
-            'ramp': 'E23',
-            'main': '-E3',
-            'conflict_lanes': ['-E3_0', '-E3_1']
-        }
+        'edges': ['-E3', 'E23','-E5','-E6','-E7','-E8'],  # 所有相关边（自动分类：主路/匝道）
+        'conflict_lanes': ['-E3_0', '-E23_0']  # 冲突车道（保留用于奖励计算）
     },
     'J14': {
         'type': 'simple_merge',
-        'main_incoming': ['E9'],
-        'main_outgoing': ['E10'],
-        'ramp_incoming': ['E15'],
-        'main_reverse': ['-E10'],
-        'num_main_lanes': 2,
-        'num_ramp_lanes': 1,
-        'has_traffic_light': True,
-        'conflict_edges': {
-            'ramp': 'E15',
-            'main': '-E10',
-            'conflict_lanes': ['-E10_0', '-E10_1']
-        }
+        'edges': ['E9','E15','E8'],
+        'conflict_lanes': ['-E9_0', 'E15_0']
     },
     'J15': {
         'type': 'complex_merge_diverge',
-        'main_incoming': ['E10'],
-        'main_outgoing': ['E11'],
-        'ramp_incoming': ['E17'],
-        'ramp_outgoing': ['E16'],
-        'main_reverse': ['-E11'],
-        'num_main_lanes': 3,
-        'num_ramp_lanes': 1,
-        'has_traffic_light': True,
-        'conflict_edges': {
-            'ramp': 'E17',
-            'main': '-E11',
-            'conflict_lanes': ['-E11_0', '-E11_1'],  # 不与-E11_2冲突
-            'diverge': 'E16'
-        }
+        'edges': [ '-E11', 'E17', 'E16','-E12'],  # 包含汇入和分流边
+        'conflict_lanes': ['-E11_0', '-E11_1','E17_0']  # 不与-E11_2冲突
     },
     'J17': {
         'type': 'high_conflict',
-        'main_incoming': ['E12'],
-        'main_outgoing': ['E13'],
-        'ramp_incoming': ['E19'],
-        'ramp_outgoing': ['E18', 'E20'],
-        'main_reverse': ['-E13'],
-        'num_main_lanes': 3,
-        'num_ramp_lanes': 2,
-        'has_traffic_light': True,
-        'conflict_edges': {
-            'ramp': 'E19',
-            'main': '-E13',
-            'conflict_lanes': ['-E13_0', '-E13_1'],  # 不与-E13_2冲突
-            'diverge': ['E18', 'E20']
-        }
+        'edges': ['-E13', 'E19', 'E20'],  # 两个分流边
+        'conflict_lanes': ['-E13_0', '-E13_1','E19_0','E19_1','E20_0']  # 不与-E13_2冲突
     }
 }
 
@@ -440,6 +399,101 @@ JUNCTION_CONFIG: Dict[str, Dict] = {
 # ============================================================================
 # 快速查询函数
 # ============================================================================
+
+def get_junction_edges(junction_id: str) -> List[str]:
+    """获取路口的所有边"""
+    if junction_id in JUNCTION_CONFIG:
+        return JUNCTION_CONFIG[junction_id].get('edges', [])
+    return []
+
+
+def get_junction_main_edges(junction_id: str) -> List[str]:
+    """获取路口的主路边（根据EDGE_TOPOLOGY自动分类）"""
+    edges = get_junction_edges(junction_id)
+    main_edges = []
+    for edge_id in edges:
+        edge_info = EDGE_TOPOLOGY.get(edge_id)
+        if edge_info and edge_info.is_main:
+            main_edges.append(edge_id)
+    return main_edges
+
+
+def get_junction_ramp_edges(junction_id: str) -> List[str]:
+    """获取路口的匝道边（根据EDGE_TOPOLOGY自动分类）"""
+    edges = get_junction_edges(junction_id)
+    ramp_edges = []
+    for edge_id in edges:
+        edge_info = EDGE_TOPOLOGY.get(edge_id)
+        if edge_info and edge_info.is_ramp:
+            ramp_edges.append(edge_id)
+    return ramp_edges
+
+
+def get_junction_diverge_edges(junction_id: str) -> List[str]:
+    """获取路口的分流边（根据EDGE_TOPOLOGY判断：有下游且为空或非主路的边）"""
+    edges = get_junction_edges(junction_id)
+    diverge_edges = []
+    for edge_id in edges:
+        edge_info = EDGE_TOPOLOGY.get(edge_id)
+        if edge_info and edge_info.is_ramp:
+            # 检查下游边是否为空（转出边特征）
+            if not edge_info.downstream:
+                diverge_edges.append(edge_id)
+    return diverge_edges
+
+
+def create_junction_config_from_dict(junc_id: str, config_dict: Dict) -> 'JunctionConfig':
+    """
+    从简化的字典配置创建完整的 JunctionConfig 对象
+
+    这个函数用于向后兼容：JunctionAgent 需要完整的 JunctionConfig 对象，
+    但我们现在使用简化的字典配置。
+
+    Args:
+        junc_id: 路口ID
+        config_dict: 简化的配置字典（包含 'edges', 'type', 'conflict_lanes'）
+
+    Returns:
+        JunctionConfig 对象
+    """
+    from junction_agent import JunctionConfig, JunctionType
+
+    edges = config_dict.get('edges', [])
+    junction_type_str = config_dict.get('type', 'simple_merge')
+    conflict_lanes = config_dict.get('conflict_lanes', [])
+
+    # 自动分类边
+    main_edges = get_junction_main_edges(junc_id)
+    ramp_edges = get_junction_ramp_edges(junc_id)
+    diverge_edges = get_junction_diverge_edges(junc_id)
+
+    # 判断路口类型
+    if junction_type_str == 'complex_merge_diverge' or junction_type_str == 'high_conflict':
+        junction_type = JunctionType.TYPE_B
+    else:
+        junction_type = JunctionType.TYPE_A
+
+    # 构建 JunctionConfig
+    return JunctionConfig(
+        junction_id=junc_id,
+        junction_type=junction_type,
+        # 自动分类的边
+        main_incoming=main_edges,  # 简化：所有主路边都作为incoming
+        main_outgoing=[],
+        ramp_incoming=[e for e in ramp_edges if e not in diverge_edges],
+        ramp_outgoing=diverge_edges,
+        reverse_incoming=[e for e in main_edges if e.startswith('-E')],
+        reverse_outgoing=[],
+        # 信号灯配置
+        has_traffic_light=True,
+        tl_id=junc_id,
+        num_phases=2,
+        # 车道级冲突信息
+        conflict_lanes=conflict_lanes,
+        num_main_lanes=2,  # 可以从 EDGE_TOPOLOGY 获取
+        num_ramp_lanes=1 if len(ramp_edges) == 1 else 2
+    )
+
 
 def get_downstream_edges(edge_id: str) -> List[str]:
     """获取下游边"""

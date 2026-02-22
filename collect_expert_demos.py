@@ -104,13 +104,13 @@ class ExpertPolicy:
         try:
             traci.vehicletype.setImperfection('CV', 0.0)
             traci.vehicletype.setTau('CV', 0.9)
-            traci.vehicletype.setAccel('CV', 0.8)
-            traci.vehicletype.setDecel('CV', 1.5)
+            traci.vehicletype.setAccel('CV', 2.1)  # 与26分脚本保持一致
+            traci.vehicletype.setDecel('CV', 4.5)  # SUMO默认值
 
             traci.vehicletype.setImperfection('HV', 0.0)
             traci.vehicletype.setTau('HV', 0.9)
-            traci.vehicletype.setAccel('HV', 0.8)
-            traci.vehicletype.setDecel('HV', 1.5)
+            traci.vehicletype.setAccel('HV', 2.1)  # 与26分脚本保持一致
+            traci.vehicletype.setDecel('HV', 4.5)  # SUMO默认值
 
             logging.info("[OK] vType configured")
             self.vtype_configured = True

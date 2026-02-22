@@ -503,17 +503,28 @@ class SUMOCompetitionFramework:
         - CTRL_SPEED_FLOOR: 最小速度 m/s (默认3.0)
         """
         import os
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-        # 道路拓扑：边的连接关系
-        NEXT_EDGE = {
-            '-E13': '-E12', '-E12': '-E11', '-E11': '-E10', '-E10': '-E9',
-            '-E9': '-E8', '-E8': '-E7', '-E7': '-E6', '-E6': '-E5',
-            '-E5': '-E3', '-E3': '-E2', '-E2': '-E1',
-            'E1': 'E2', 'E2': 'E3', 'E3': 'E5', 'E5': 'E6',
-            'E6': 'E7', 'E7': 'E8', 'E8': 'E9', 'E9': 'E10',
-            'E10': 'E11', 'E11': 'E12', 'E12': 'E13',
-            'E23': '-E2', 'E15': 'E10', 'E17': '-E10', 'E19': '-E12',
-        }
+        # 道路拓扑：从 road_topology_hardcoded.py 动态获取边的连接关系
+        try:
+            from road_topology_hardcoded import EDGE_TOPOLOGY
+            # 构建 NEXT_EDGE 字典（只取第一个下游边）
+            NEXT_EDGE = {}
+            for edge_id, edge_info in EDGE_TOPOLOGY.items():
+                if edge_info.downstream:
+                    NEXT_EDGE[edge_id] = edge_info.downstream[0]  # 取第一个下游边
+        except ImportError:
+            # 回退到硬编码（向后兼容）
+            NEXT_EDGE = {
+                '-E13': '-E12', '-E12': '-E11', '-E11': '-E10', '-E10': '-E9',
+                '-E9': '-E8', '-E8': '-E7', '-E7': '-E6', '-E6': '-E5',
+                '-E5': '-E3', '-E3': '-E2', '-E2': '-E1',
+                'E1': 'E2', 'E2': 'E3', 'E3': 'E5', 'E5': 'E6',
+                'E6': 'E7', 'E7': 'E8', 'E8': 'E9', 'E9': 'E10',
+                'E10': 'E11', 'E11': 'E12', 'E12': 'E13',
+                'E23': '-E2', 'E15': 'E10', 'E17': '-E10', 'E19': '-E12',
+            }
 
         SPEED_LIMIT = 13.89
         CONGEST_SPEED = float(os.environ.get('CTRL_CONGEST_SPEED', '5.0'))
