@@ -28,6 +28,170 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from junction_agent import JUNCTION_CONFIGS
 from junction_network import VehicleLevelMultiJunctionModel
 from config import NetworkConfig
+
+
+# ============================================================================
+# 路口配置（与训练时保持一致）
+# ============================================================================
+
+TRAINING_JUNCTION_CONFIGS = {
+    'J5': {
+        'type': 'TYPE_A',
+        'main_edges': ['E2', 'E3'],
+        'ramp_edges': ['E23'],
+        'reverse_edges': ['-E3', '-E2'],
+        'tl_id': 'J5',
+        'num_phases': 2,
+    },
+    'J14': {
+        'type': 'TYPE_A',
+        'main_edges': ['E9', 'E10'],
+        'ramp_edges': ['E15'],
+        'reverse_edges': ['-E10', '-E9'],
+        'tl_id': 'J14',
+        'num_phases': 2,
+    },
+    'J15': {
+        'type': 'TYPE_B',
+        'main_edges': ['E6', 'E7'],
+        'ramp_edges': ['E17'],
+        'diverge_edges': ['E19'],
+        'reverse_edges': ['-E7', '-E6'],
+        'tl_id': 'J15',
+        'num_phases': 2,
+    },
+    'J17': {
+        'type': 'TYPE_A',
+        'main_edges': ['E11', 'E12'],
+        'ramp_edges': ['E18'],
+        'reverse_edges': ['-E12', '-E11'],
+        'tl_id': 'J17',
+        'num_phases': 2,
+    },
+}
+
+
+# ============================================================================
+# 工具函数：构建状态向量
+# ============================================================================
+
+def build_junction_state(junc_id: str, junc_config: dict, subscribed_vehicles: dict, edge_speeds: dict, SPEED_LIMIT: float = 13.89) -> np.ndarray:
+    """
+    构建23维路口状态向量（与训练时保持一致）
+
+    Args:
+        junc_id: 路口ID
+        junc_config: 路口配置字典（与训练时格式相同）
+        subscribed_vehicles: 订阅的车辆数据
+        edge_speeds: 边速度缓存
+        SPEED_LIMIT: 速度限制
+
+    Returns:
+        23维状态向量
+    """
+    state = np.zeros(23, dtype=np.float32)
+
+    try:
+        # 使用字典访问获取边列表
+        main_edges = junc_config['main_edges']
+        ramp_edges = junc_config['ramp_edges']
+
+        # 统计主路车辆
+        main_vehicles = []
+        for veh_id, data in subscribed_vehicles.items():
+            if data.get('is_cv', False) and data.get('road_id', '') in main_edges:
+                main_vehicles.append(data)
+
+        # 统计匝道车辆
+        ramp_vehicles = []
+        for veh_id, data in subscribed_vehicles.items():
+            if data.get('is_cv', False) and data.get('road_id', '') in ramp_edges:
+                ramp_vehicles.append(data)
+
+        # 主路统计 (0-5)
+        if main_vehicles:
+            main_speeds = [v['speed'] for v in main_vehicles]
+            main_avg_speed = np.mean(main_speeds)
+            main_queue = sum(1 for v in main_vehicles if v['speed'] < 1.0)
+            main_queue_norm = min(main_queue / 20.0, 1.0)
+            main_occupancy = len(main_vehicles) / 50.0  # 假设最大容量50辆
+        else:
+            main_avg_speed = SPEED_LIMIT
+            main_queue_norm = 0.0
+            main_occupancy = 0.0
+
+        state[0] = main_avg_speed / SPEED_LIMIT
+        state[1] = main_avg_speed / SPEED_LIMIT
+        state[2] = 0.0  # 加速度简化
+        state[3] = main_queue_norm
+        state[4] = 0.0  # 密度简化
+        state[5] = main_occupancy
+
+        # 匝道统计 (6-8)
+        if ramp_vehicles:
+            ramp_speeds = [v['speed'] for v in ramp_vehicles]
+            ramp_avg_speed = np.mean(ramp_speeds)
+            ramp_queue = sum(1 for v in ramp_vehicles if v['speed'] < 1.0)
+            ramp_queue_norm = min(ramp_queue / 20.0, 1.0)
+            ramp_occupancy = len(ramp_vehicles) / 30.0  # 假设最大容量30辆
+        else:
+            ramp_avg_speed = SPEED_LIMIT
+            ramp_queue_norm = 0.0
+            ramp_occupancy = 0.0
+
+        state[6] = ramp_avg_speed / SPEED_LIMIT
+        state[7] = ramp_queue_norm
+        state[8] = ramp_occupancy
+
+        # 下游速度 (9-14) - 使用edge_speeds
+        NEXT_EDGE = {
+            '-E13': '-E12', '-E12': '-E11', '-E11': '-E10', '-E10': '-E9',
+            '-E9': '-E8', '-E8': '-E7', '-E7': '-E6', '-E6': '-E5',
+            '-E5': '-E3', '-E3': '-E2', '-E2': '-E1',
+            'E1': 'E2', 'E2': 'E3', 'E3': 'E5', 'E5': 'E6',
+            'E6': 'E7', 'E7': 'E8', 'E8': 'E9', 'E9': 'E10',
+            'E10': 'E11', 'E11': 'E12', 'E12': 'E13',
+            'E23': '-E2', 'E15': 'E10', 'E17': '-E10', 'E19': '-E12',
+        }
+
+        # 获取下游6条边的速度
+        downstream_edges = []
+        if main_edges:
+            start_edge = main_edges[0] if main_edges[0] in NEXT_EDGE else None
+            if start_edge:
+                nxt = start_edge
+                for _ in range(6):
+                    nxt = NEXT_EDGE.get(nxt)
+                    if nxt is None:
+                        break
+                    downstream_edges.append(nxt)
+
+        for i in range(6):
+            if i < len(downstream_edges):
+                ds_speed = edge_speeds.get(downstream_edges[i], SPEED_LIMIT)
+                state[9 + i] = ds_speed / SPEED_LIMIT
+            else:
+                state[9 + i] = 1.0  # 无拥堵
+
+        # 冲突风险 (15) - 简化计算
+        conflict_risk = 0.0
+        if main_vehicles and ramp_vehicles:
+            # 如果主路和匝道都有车，有潜在冲突
+            slow_main_ratio = sum(1 for v in main_vehicles if v['speed'] < 5.0) / max(len(main_vehicles), 1)
+            slow_ramp_ratio = sum(1 for v in ramp_vehicles if v['speed'] < 5.0) / max(len(ramp_vehicles), 1)
+            conflict_risk = (slow_main_ratio + slow_ramp_ratio) / 2.0
+
+        state[15] = conflict_risk
+
+        # 16-22: 预留，保持为0
+
+    except Exception as e:
+        # 如果出错，返回零向量
+        pass
+
+    return state
+
+
 from road_topology_hardcoded import (
     get_junction_main_edges,
     get_junction_ramp_edges,
@@ -402,15 +566,41 @@ class BCSubmissionGenerator:
         junction_vehicle_obs = {}
         junction_controlled = {}
 
-        for junc_id in JUNCTION_CONFIGS.keys():
+        # 维护边速度缓存
+        edge_speeds = {}
+        for edge_id in traci.edge.getIDList():
+            try:
+                edge_speeds[edge_id] = traci.edge.getLastStepMeanSpeed(edge_id)
+            except:
+                edge_speeds[edge_id] = SPEED_LIMIT
+
+        # 收集所有CV车辆数据用于状态构建
+        subscribed_vehicles = {}
+        for veh_id in traci.vehicle.getIDList():
+            if traci.vehicle.getTypeID(veh_id) == 'CV':
+                try:
+                    road_id = traci.vehicle.getRoadID(veh_id)
+                    speed = traci.vehicle.getSpeed(veh_id)
+                    subscribed_vehicles[veh_id] = {
+                        'is_cv': True,
+                        'road_id': road_id,
+                        'speed': speed
+                    }
+                except:
+                    continue
+
+        for junc_id in TRAINING_JUNCTION_CONFIGS.keys():
             controlled, vehicle_features = self._get_controlled_vehicles(junc_id)
 
             if not any(controlled.values()):
                 continue
 
-            # 构建全局状态（23维，简化为零）
-            # 注意：训练时也是用零状态
-            state_tensor = torch.zeros(1, 23, dtype=torch.float32).to(self.device)
+            # 构建全局状态（23维，使用真实数据）
+            state_vec = build_junction_state(
+                junc_id, TRAINING_JUNCTION_CONFIGS[junc_id],
+                subscribed_vehicles, edge_speeds, SPEED_LIMIT
+            )
+            state_tensor = torch.tensor(state_vec, dtype=torch.float32).unsqueeze(0).to(self.device)
 
             # 构建车辆观测
             veh_obs_dict = {'main': None, 'ramp': None, 'diverge': None}
@@ -484,7 +674,9 @@ class BCSubmissionGenerator:
                 for i, veh_id in enumerate(controlled['main']):
                     if i < len(main_actions):
                         action_val = main_actions[i].item()
-                        target_speed = SPEED_LIMIT * max(action_val, 0.1)
+                        # 避免过度减速：设置下限为0.6
+                        action_val = max(action_val, 0.6)
+                        target_speed = SPEED_LIMIT * action_val
                         traci.vehicle.setSpeed(veh_id, target_speed)
                         total_speed_set += 1
 
@@ -494,7 +686,9 @@ class BCSubmissionGenerator:
                 for i, veh_id in enumerate(controlled['ramp']):
                     if i < len(ramp_actions):
                         action_val = ramp_actions[i].item()
-                        target_speed = SPEED_LIMIT * max(action_val, 0.1)
+                        # 匝道也需要下限
+                        action_val = max(action_val, 0.6)
+                        target_speed = SPEED_LIMIT * action_val
                         traci.vehicle.setSpeed(veh_id, target_speed)
                         total_speed_set += 1
 
@@ -504,7 +698,8 @@ class BCSubmissionGenerator:
                 for i, veh_id in enumerate(controlled['diverge']):
                     if i < len(diverge_actions):
                         action_val = diverge_actions[i].item()
-                        target_speed = SPEED_LIMIT * max(action_val, 0.1)
+                        action_val = max(action_val, 0.6)
+                        target_speed = SPEED_LIMIT * action_val
                         traci.vehicle.setSpeed(veh_id, target_speed)
                         total_speed_set += 1
 
