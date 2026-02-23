@@ -1,0 +1,12 @@
+{
+  "baseline_ocr": 0.9404225352112676,
+  "baseline_speed_std": 6.40690067442023,
+  "baseline_mean_accel": 0.3003533848514423,
+  "W_efficiency": 0.5,
+  "W_stability": 0.5,
+  "scaling_factor": 18.67870621398873,
+  "calibrated_with": [
+    "submit.pkl",
+    "submission.pkl"
+  ]
+}

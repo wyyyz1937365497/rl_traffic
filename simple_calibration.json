@@ -1,0 +1,12 @@
+{
+  "ocr_weight": 1100.9536556451617,
+  "ocr_baseline": 0.9444225352112676,
+  "intercept": 14.664046344354833,
+  "mean_active_baseline": 287.02930555555554,
+  "final_active_baseline": 294.5,
+  "mae": 1.0658141036401503e-14,
+  "calibrated_with": [
+    "submit.pkl",
+    "submission.pkl"
+  ]
+}

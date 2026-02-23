@@ -81,8 +81,9 @@ class ModelSubmissionGenerator:
         """加载训练好的模型"""
         print(f"加载模型: {self.checkpoint_path}")
 
-        # 创建模型（使用车辆级控制）
-        self.model = create_vehicle_level_model(JUNCTION_CONFIG, NetworkConfig()).to(self.device)
+        # 创建模型（使用路口级网络）
+        from junction_network import create_junction_model
+        self.model = create_junction_model(JUNCTION_CONFIG, NetworkConfig()).to(self.device)
 
         # 加载checkpoint
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
@@ -96,7 +97,7 @@ class ModelSubmissionGenerator:
         self.model.load_state_dict(model_state)
         self.model.eval()
 
-        print(f"✓ 模型加载成功")
+        print(f"✓ 模型加载成功 (设备: {self.device})")
 
     def generate_pkl(self, output_path: str, max_steps: int = 3600, seed: int = 42) -> str:
         """生成PKL文件"""
@@ -270,45 +271,42 @@ class ModelSubmissionGenerator:
                         'diverge': self._get_vehicle_features(controlled.get('diverge', []))
                     }
 
-                # 模型推理
+                # 模型推理（路口级网络）
                 with torch.no_grad():
-                    actions, values, info = self.model(obs_tensors, vehicle_obs, deterministic=True)
+                    output = self.model(obs_tensors, deterministic=True)
 
-                # 转换动作并应用（车辆级控制）
-                for junc_id, action in actions.items():
+                # 应用动作（路口级控制：同一个路口的CV车辆共享动作）
+                for junc_id, action_dict in output.items():
                     controlled = self._get_controlled_vehicles(junc_id)
 
-                    # 主路车辆：每辆车独立动作
-                    if controlled['main'] and 'main_actions' in action:
-                        main_actions = action['main_actions']  # [1, num_main]
-                        num_main = min(len(controlled['main']), main_actions.size(1))
-                        for i, veh_info in enumerate(controlled['main'][:num_main]):
+                    # 主路动作
+                    if 'main' in action_dict and controlled['main']:
+                        main_action_val = action_dict['main'].item()  # 标量
+                        max_speed = 13.89  # SUMO默认最大速度
+                        target_speed = max_speed * main_action_val
+
+                        for veh_info in controlled['main']:
                             veh_id = veh_info['id']
-                            action_val = main_actions[0, i].item()
-                            max_speed = traci.vehicle.getAllowedSpeed(veh_id)
-                            target_speed = max_speed * action_val
                             traci.vehicle.setSpeed(veh_id, target_speed)
 
-                    # 匝道车辆：每辆车独立动作
-                    if controlled['ramp'] and 'ramp_actions' in action:
-                        ramp_actions = action['ramp_actions']  # [1, num_ramp]
-                        num_ramp = min(len(controlled['ramp']), ramp_actions.size(1))
-                        for i, veh_info in enumerate(controlled['ramp'][:num_ramp]):
+                    # 匝道动作
+                    if 'ramp' in action_dict and controlled['ramp']:
+                        ramp_action_val = action_dict['ramp'].item()
+                        max_speed = 13.89
+                        target_speed = max_speed * ramp_action_val
+
+                        for veh_info in controlled['ramp']:
                             veh_id = veh_info['id']
-                            action_val = ramp_actions[0, i].item()
-                            max_speed = traci.vehicle.getAllowedSpeed(veh_id)
-                            target_speed = max_speed * action_val
                             traci.vehicle.setSpeed(veh_id, target_speed)
 
-                    # 分流车辆：每辆车独立动作
-                    if controlled.get('diverge') and 'diverge_actions' in action:
-                        diverge_actions = action['diverge_actions']  # [1, num_diverge]
-                        num_diverge = min(len(controlled['diverge']), diverge_actions.size(1))
-                        for i, veh_info in enumerate(controlled['diverge'][:num_diverge]):
+                    # 分流动作（如果存在）
+                    if 'diverge' in action_dict and controlled.get('diverge'):
+                        diverge_action_val = action_dict['diverge'].item()
+                        max_speed = 13.89
+                        target_speed = max_speed * diverge_action_val
+
+                        for veh_info in controlled['diverge']:
                             veh_id = veh_info['id']
-                            action_val = diverge_actions[0, i].item()
-                            max_speed = traci.vehicle.getAllowedSpeed(veh_id)
-                            target_speed = max_speed * action_val
                             traci.vehicle.setSpeed(veh_id, target_speed)
 
                 # 进度报告（每500步）- 移到if obs块内部
@@ -933,7 +931,7 @@ def main():
                         help='仿真步数')
     parser.add_argument('--seed', type=int, default=42,
                         help='随机种子')
-    parser.add_argument('--device', type=str, default='cpu',
+    parser.add_argument('--device', type=str, default='cuda',
                         help='计算设备 (cpu/cuda)')
 
     args = parser.parse_args()
