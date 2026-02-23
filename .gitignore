@@ -2,10 +2,34 @@
 *.pth
 *.pyc
 *.pkl
+*.pt
 *.zip
 sumo/logs_parallel/
 .claude/
 tmp/
 logs/
-checkpoints\evaluations/
+checkpoints/evaluations/
 *.log
+
+# BC checkpoints
+bc_checkpoints*/
+
+# Expert demos
+expert_demos*/
+
+# Submit files
+submit_*.pkl
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+nul
