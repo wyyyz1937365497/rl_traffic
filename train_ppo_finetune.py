@@ -120,8 +120,16 @@ class PPOFinetuner:
         config = NetworkConfig()
         model = VehicleLevelMultiJunctionModel(JUNCTION_CONFIGS, config)
 
-        # 加载权重
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        # 检测设备可用性
+        device = self.device
+        if device == 'cuda' and not torch.cuda.is_available():
+            logging.warning("CUDA不可用，自动切换到CPU")
+            device = 'cpu'
+            self.device = 'cpu'  # 更新实际使用的设备
+
+        # 加载权重（使用正确的map_location）
+        map_location = torch.device(device)
+        checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
 
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
@@ -136,11 +144,12 @@ class PPOFinetuner:
         pretrained_dict = {k: v for k, v in state_dict.items() if k in model_state and model_state[k].shape == v.shape}
 
         model.load_state_dict(pretrained_dict, strict=False)
-        model = model.to(self.device)
+        model = model.to(device)
 
         loaded_keys = len(pretrained_dict)
         total_keys = len(model_state)
-        logging.info(f"  ✓ 加载权重: {loaded_keys}/{total_keys} 参数")
+        logging.info(f"  [OK] 加载权重: {loaded_keys}/{total_keys} 参数")
+        logging.info(f"  设备: {device}")
 
         # 统计参数
         total_params = sum(p.numel() for p in model.parameters())
@@ -363,6 +372,57 @@ class PPOFinetuner:
 
         return breakdown['total'], breakdown
 
+    def _build_model_inputs(self, env: MultiAgentEnvironment, state_vectors: Dict[str, np.ndarray]):
+        """
+        构建模型输入（junction_observations + vehicle_observations）
+
+        Args:
+            env: SUMO环境
+            state_vectors: 路口状态向量字典
+
+        Returns:
+            junction_observations: Dict[junc_id, torch.Tensor]
+            vehicle_observations: Dict[junc_id, Dict[str, torch.Tensor]]
+        """
+        import traci
+
+        junction_observations = {}
+        vehicle_observations = {}
+
+        try:
+            for junc_id, state_vec in state_vectors.items():
+                # 转换状态向量为tensor
+                junction_observations[junc_id] = torch.tensor(state_vec, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+                # 获取该路口的agent
+                if junc_id not in env.agents:
+                    continue
+
+                agent = env.agents[junc_id]
+
+                # 获取受控车辆（复用generate_submit_bc.py的逻辑）
+                try:
+                    controlled, vehicle_features = agent._get_controlled_vehicles()
+
+                    # 构建vehicle_observations
+                    veh_obs_dict = {}
+                    for veh_type in ['main', 'ramp', 'diverge']:
+                        if veh_type in vehicle_features and vehicle_features[veh_type] is not None:
+                            # 转换为tensor
+                            feats = vehicle_features[veh_type]
+                            if len(feats) > 0:
+                                veh_obs_dict[veh_type] = torch.tensor(feats, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+                    vehicle_observations[junc_id] = veh_obs_dict
+                except Exception as e:
+                    # 如果获取失败，使用空字典
+                    vehicle_observations[junc_id] = {}
+
+        except Exception as e:
+            logging.warning(f"构建模型输入时出错: {e}")
+
+        return junction_observations, vehicle_observations
+
     def collect_episode(self, env: MultiAgentEnvironment, max_steps: int = 3600) -> Dict:
         """
         收集一个episode的经验
@@ -382,15 +442,18 @@ class PPOFinetuner:
         reward_breakdowns = []
 
         # 重置环境
-        observations = env.reset()
+        state_vectors = env.reset()  # Dict[junc_id, np.ndarray]
 
         for step in tqdm(range(max_steps), desc="收集episode"):
+            # 构建模型输入（包含车辆观测）
+            junction_observations, vehicle_observations = self._build_model_inputs(env, state_vectors)
+
             # 选择动作
             with torch.no_grad():
-                actions, log_probs, values = self._select_actions(observations)
+                actions, log_probs, values = self._select_actions(junction_observations, vehicle_observations)
 
             # 执行动作
-            next_observations, rewards, dones, info = env.step(actions)
+            next_state_vectors, rewards, dones, info = env.step(actions)
 
             # 计算奖励（带分解）
             reward, breakdown = self.compute_reward_with_breakdown(info)
@@ -398,13 +461,13 @@ class PPOFinetuner:
             episode_rewards.append(reward)
             reward_breakdowns.append(breakdown)
 
-            # 存储经验
-            for junc_id, obs in observations.items():
+            # 存储经验（存储原始状态向量）
+            for junc_id, state_vec in state_vectors.items():
                 if junc_id in actions:
                     buffer.add(
                         junc_id=junc_id,
-                        state=obs,
-                        vehicle_state=info.get('vehicle_states', {}).get(junc_id, {}),
+                        state=state_vec,
+                        vehicle_state={},  # 简化，暂不存储车辆状态
                         action=actions[junc_id],
                         reward=reward,
                         value=values.get(junc_id, 0.0),
@@ -412,7 +475,7 @@ class PPOFinetuner:
                         done=dones
                     )
 
-            observations = next_observations
+            state_vectors = next_state_vectors
 
             if dones:
                 break
@@ -452,9 +515,13 @@ class PPOFinetuner:
 
         return episode_data
 
-    def _select_actions(self, observations: Dict) -> Tuple[Dict, Dict, Dict]:
+    def _select_actions(self, junction_observations: Dict, vehicle_observations: Dict) -> Tuple[Dict, Dict, Dict]:
         """
         选择动作（车辆级模型）
+
+        Args:
+            junction_observations: Dict[junc_id, torch.Tensor]
+            vehicle_observations: Dict[junc_id, Dict[str, torch.Tensor]]
 
         Returns:
             actions: {junction_id: action_dict}
@@ -465,18 +532,10 @@ class PPOFinetuner:
         log_probs = {}
         values = {}
 
-        # 转换为模型输入格式
-        model_observations = {}
-        vehicle_observations = {}
-
-        for junc_id, obs in observations.items():
-            model_observations[junc_id] = obs
-            vehicle_observations[junc_id] = obs.get('vehicle_observations', {})
-
         # 模型推理
         with torch.no_grad():
             all_actions, all_values, _ = self.model(
-                model_observations,
+                junction_observations,
                 vehicle_observations,
                 deterministic=False  # 采样
             )
