@@ -1,249 +1,349 @@
 """
-车辆级控制网络
-为每辆CV车辆输出独立的连续动作（速度控制）
+车辆级控制网络组件
+提供 VehicleLevelJunctionNetwork 供 BC / PPO 复用
 """
+
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, Optional
+from torch.distributions import Categorical
 
 
-class VehicleLevelController(nn.Module):
-    """
-    车辆级控制器
-    为每辆车输出独立的连续动作
+class VehicleTypeController(nn.Module):
+    """单类车辆控制器（main/ramp/diverge）"""
 
-    输入:
-        - state: [batch, state_dim] 路口状态
-        - vehicles: [batch, max_vehicles, vehicle_feat_dim] 车辆特征
-
-    输出:
-        - vehicle_actions: [batch, max_vehicles, 1] 每辆车的动作（0-1连续值）
-        - value: [batch, 1] 状态价值
-    """
-
-    def __init__(self, state_dim: int = 23, vehicle_feat_dim: int = 8, hidden_dim: int = 64):
+    def __init__(self, state_dim: int, vehicle_feat_dim: int, hidden_dim: int = 64):
         super().__init__()
 
-        self.state_dim = state_dim
-        self.vehicle_feat_dim = vehicle_feat_dim
-        self.hidden_dim = hidden_dim
-
-        # 状态编码器
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
         )
 
-        # 车辆特征编码器
         self.vehicle_encoder = nn.Sequential(
             nn.Linear(vehicle_feat_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
 
-        # 车辆间注意力机制（捕捉车辆之间的相互影响）
         self.vehicle_attention = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=4,
             batch_first=True
         )
 
-        # 车辆动作头（为每辆车输出动作）
         self.vehicle_action_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),  # 车辆特征 + 全局状态
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 32),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()  # 输出0-1的连续值
+            nn.Linear(hidden_dim // 2, 11)
         )
 
-        # 价值头
         self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, 64),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, state, vehicles, vehicle_mask=None):
-        """
-        前向传播
+    def _encode(self, state: torch.Tensor, vehicles: torch.Tensor) -> torch.Tensor:
+        """编码状态与车辆特征，输出每辆车融合特征 [N, 2H]"""
+        if vehicles is None or vehicles.numel() == 0:
+            return torch.empty(0, 0, device=state.device)
+
+        if vehicles.dim() == 3:
+            vehicles = vehicles.squeeze(0)
+
+        state_feat = self.state_encoder(state)  # [1, H]
+        veh_feat = self.vehicle_encoder(vehicles)  # [N, H]
+
+        q = veh_feat.unsqueeze(0)
+        k = veh_feat.unsqueeze(0)
+        v = veh_feat.unsqueeze(0)
+        attn_out, _ = self.vehicle_attention(q, k, v)
+        attn_out = attn_out.squeeze(0)  # [N, H]
+
+        state_expand = state_feat.expand(attn_out.size(0), -1)
+        return torch.cat([state_expand, attn_out], dim=-1)  # [N, 2H]
+
+    def _encode_batched(self, state: torch.Tensor, vehicles: torch.Tensor) -> torch.Tensor:
+        """编码批量状态与车辆特征，输出 [B, N, 2H]"""
+        # state: [B, state_dim], vehicles: [B, N, feat]
+        state_feat = self.state_encoder(state)      # [B, H]
+        veh_feat = self.vehicle_encoder(vehicles)   # [B, N, H]
+
+        attn_out, _ = self.vehicle_attention(veh_feat, veh_feat, veh_feat)
+        state_expand = state_feat.unsqueeze(1).expand(-1, veh_feat.size(1), -1)
+        return torch.cat([state_expand, attn_out], dim=-1)  # [B, N, 2H]
+
+    def act(
+        self,
+        state: torch.Tensor,
+        vehicles: Optional[torch.Tensor],
+        deterministic: bool = False
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        if vehicles is None:
+            return {
+                'actions': None,
+                'action_indices': None,
+                'log_probs': None,
+                'entropies': None,
+                'value': None,
+                'logits': None,
+            }
+
+        fused = self._encode(state, vehicles)
+        if fused.numel() == 0:
+            return {
+                'actions': None,
+                'action_indices': None,
+                'log_probs': None,
+                'entropies': None,
+                'value': None,
+                'logits': None,
+            }
+
+        logits = self.vehicle_action_head(fused)
+        dist = Categorical(logits=logits)
+
+        if deterministic:
+            action_idx = torch.argmax(logits, dim=-1)
+        else:
+            action_idx = dist.sample()
+
+        actions = action_idx.float() / 10.0
+        log_probs = dist.log_prob(action_idx)
+        entropies = dist.entropy()
+        values = self.value_head(fused).squeeze(-1)
+
+        return {
+            'actions': actions,
+            'action_indices': action_idx,
+            'log_probs': log_probs,
+            'entropies': entropies,
+            'value': values.mean(),
+            'logits': logits,
+        }
+
+    def evaluate_actions(
+        self,
+        state: torch.Tensor,
+        vehicles: Optional[torch.Tensor],
+        action_values: Optional[torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        if vehicles is None or action_values is None:
+            zero = torch.tensor(0.0, device=state.device)
+            return {
+                'log_prob_sum': zero,
+                'entropy_mean': zero,
+                'value': zero,
+            }
+
+        fused = self._encode(state, vehicles)
+        if fused.numel() == 0:
+            zero = torch.tensor(0.0, device=state.device)
+            return {
+                'log_prob_sum': zero,
+                'entropy_mean': zero,
+                'value': zero,
+            }
+
+        logits = self.vehicle_action_head(fused)
+        dist = Categorical(logits=logits)
+
+        action_idx = torch.clamp((action_values * 10.0).round().long(), 0, 10)
+        if action_idx.dim() > 1:
+            action_idx = action_idx.squeeze(0)
+
+        log_prob = dist.log_prob(action_idx).sum()
+        entropy = dist.entropy().mean()
+        value = self.value_head(fused).mean()
+
+        return {
+            'log_prob_sum': log_prob,
+            'entropy_mean': entropy,
+            'value': value,
+        }
+
+    def evaluate_actions_batched(
+        self,
+        state: torch.Tensor,
+        vehicles: Optional[torch.Tensor],
+        action_values: Optional[torch.Tensor],
+        vehicle_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """批量评估动作（向量化）
 
         Args:
-            state: [batch_size, state_dim] 路口状态
-            vehicles: [batch_size, num_vehicles, vehicle_feat_dim] 车辆特征
-            vehicle_mask: [batch_size, num_vehicles] 车辆掩码（标记真实车辆）
-
-        Returns:
-            actions: [batch_size, num_vehicles] 每辆车的动作（0-1）
-            value: [batch_size, 1] 状态价值
+            state: [B, state_dim]
+            vehicles: [B, N, feat]
+            action_values: [B, N]
+            vehicle_mask: [B, N]，1为有效车辆
         """
-        batch_size, num_vehicles, _ = vehicles.shape
-        device = vehicles.device
+        if vehicles is None or action_values is None:
+            zero = torch.zeros(state.size(0), device=state.device)
+            return {
+                'log_prob_sum': zero,
+                'entropy_mean': zero,
+                'value': zero,
+            }
 
-        # 编码状态
-        state_feat = self.state_encoder(state)  # [batch, hidden]
+        fused = self._encode_batched(state, vehicles)  # [B, N, 2H]
+        logits = self.vehicle_action_head(fused)       # [B, N, 11]
+        dist = Categorical(logits=logits)
 
-        # 编码车辆特征
-        vehicle_feat = self.vehicle_encoder(vehicles)  # [batch, num_vehicles, hidden]
+        action_idx = torch.clamp((action_values * 10.0).round().long(), 0, 10)  # [B, N]
+        log_prob = dist.log_prob(action_idx)  # [B, N]
+        entropy = dist.entropy()              # [B, N]
+        value = self.value_head(fused).squeeze(-1)  # [B, N]
 
-        # 自注意力：让车辆之间相互感知
-        attn_out, _ = self.vehicle_attention(
-            vehicle_feat, vehicle_feat, vehicle_feat
-        )  # [batch, num_vehicles, hidden]
-
-        # 残差连接
-        vehicle_feat = vehicle_feat + attn_out
-
-        # 全局状态扩展到每辆车
-        global_state_expanded = state_feat.unsqueeze(1).expand(-1, num_vehicles, -1)
-
-        # 拼接车辆特征和全局状态
-        combined_feat = torch.cat([vehicle_feat, global_state_expanded], dim=-1)
-        # [batch, num_vehicles, hidden*2]
-
-        # 为每辆车输出动作
-        vehicle_actions = self.vehicle_action_head(combined_feat).squeeze(-1)
-        # [batch, num_vehicles]
-
-        # 如果有掩码，将无效位置的动作设为0
         if vehicle_mask is not None:
-            vehicle_actions = vehicle_actions * vehicle_mask
+            mask = vehicle_mask.float()
+            denom = torch.clamp(mask.sum(dim=1), min=1.0)
+            log_prob_sum = (log_prob * mask).sum(dim=1)
+            entropy_mean = (entropy * mask).sum(dim=1) / denom
+            value_mean = (value * mask).sum(dim=1) / denom
+        else:
+            log_prob_sum = log_prob.sum(dim=1)
+            entropy_mean = entropy.mean(dim=1)
+            value_mean = value.mean(dim=1)
 
-        # 计算价值（使用全局特征）
-        global_feat = torch.cat([state_feat, vehicle_feat.mean(dim=1)], dim=-1)
-        value = self.value_head(global_feat)
-
-        return vehicle_actions, value
+        return {
+            'log_prob_sum': log_prob_sum,
+            'entropy_mean': entropy_mean,
+            'value': value_mean,
+        }
 
 
 class VehicleLevelJunctionNetwork(nn.Module):
-    """
-    车辆级路口网络
-    分别处理主路、匝道、分流车辆
-    """
+    """路口级车辆控制网络"""
 
-    def __init__(self, state_dim: int = 23, vehicle_feat_dim: int = 8, hidden_dim: int = 64):
+    def __init__(self, state_dim: int, vehicle_feat_dim: int, hidden_dim: int = 64):
         super().__init__()
 
-        # 主路车辆控制器
-        self.main_controller = VehicleLevelController(
-            state_dim=state_dim,
-            vehicle_feat_dim=vehicle_feat_dim,
-            hidden_dim=hidden_dim
+        self.main_controller = VehicleTypeController(state_dim, vehicle_feat_dim, hidden_dim)
+        self.ramp_controller = VehicleTypeController(state_dim, vehicle_feat_dim, hidden_dim)
+        self.diverge_controller = VehicleTypeController(state_dim, vehicle_feat_dim, hidden_dim)
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        main_vehicles: Optional[torch.Tensor] = None,
+        ramp_vehicles: Optional[torch.Tensor] = None,
+        diverge_vehicles: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        main_out = self.main_controller.act(state, main_vehicles, deterministic)
+        ramp_out = self.ramp_controller.act(state, ramp_vehicles, deterministic)
+        diverge_out = self.diverge_controller.act(state, diverge_vehicles, deterministic)
+
+        values = [v for v in [main_out['value'], ramp_out['value'], diverge_out['value']] if v is not None]
+        if values:
+            joint_value = torch.stack(values).mean()
+        else:
+            joint_value = torch.tensor(0.0, device=state.device)
+
+        return {
+            'main_actions': main_out['actions'],
+            'ramp_actions': ramp_out['actions'],
+            'diverge_actions': diverge_out['actions'],
+            'main_log_probs': main_out['log_probs'],
+            'ramp_log_probs': ramp_out['log_probs'],
+            'diverge_log_probs': diverge_out['log_probs'],
+            'main_entropies': main_out['entropies'],
+            'ramp_entropies': ramp_out['entropies'],
+            'diverge_entropies': diverge_out['entropies'],
+            'main_logits': main_out['logits'],
+            'ramp_logits': ramp_out['logits'],
+            'diverge_logits': diverge_out['logits'],
+            'value': joint_value,
+        }
+
+    def evaluate_actions(
+        self,
+        state: torch.Tensor,
+        vehicle_observations: Dict[str, torch.Tensor],
+        action_dict: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        main_eval = self.main_controller.evaluate_actions(
+            state,
+            vehicle_observations.get('main'),
+            action_dict.get('main_actions')
+        )
+        ramp_eval = self.ramp_controller.evaluate_actions(
+            state,
+            vehicle_observations.get('ramp'),
+            action_dict.get('ramp_actions')
+        )
+        diverge_eval = self.diverge_controller.evaluate_actions(
+            state,
+            vehicle_observations.get('diverge'),
+            action_dict.get('diverge_actions')
         )
 
-        # 匝道车辆控制器
-        self.ramp_controller = VehicleLevelController(
-            state_dim=state_dim,
-            vehicle_feat_dim=vehicle_feat_dim,
-            hidden_dim=hidden_dim
-        )
+        log_prob_sum = main_eval['log_prob_sum'] + ramp_eval['log_prob_sum'] + diverge_eval['log_prob_sum']
+        entropy_mean = torch.stack([
+            main_eval['entropy_mean'],
+            ramp_eval['entropy_mean'],
+            diverge_eval['entropy_mean']
+        ]).mean()
+        value = torch.stack([
+            main_eval['value'],
+            ramp_eval['value'],
+            diverge_eval['value']
+        ]).mean()
 
-        # 分流车辆控制器（如果存在）
-        self.diverge_controller = VehicleLevelController(
-            state_dim=state_dim,
-            vehicle_feat_dim=vehicle_feat_dim,
-            hidden_dim=hidden_dim
-        )
+        return {
+            'log_prob_sum': log_prob_sum,
+            'entropy_mean': entropy_mean,
+            'value': value,
+        }
 
-    def forward(self, state, main_vehicles=None, ramp_vehicles=None, diverge_vehicles=None):
-        """
-        前向传播
+    def evaluate_actions_batched(
+        self,
+        state: torch.Tensor,
+        vehicle_observations: Dict[str, torch.Tensor],
+        action_dict: Dict[str, torch.Tensor],
+        mask_dict: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """批量评估路口动作
 
         Args:
-            state: [batch, state_dim] 路口状态
-            main_vehicles: [batch, num_main, vehicle_feat_dim] or None
-            ramp_vehicles: [batch, num_ramp, vehicle_feat_dim] or None
-            diverge_vehicles: [batch, num_diverge, vehicle_feat_dim] or None
-
-        Returns:
-            dict with keys:
-                - 'main_actions': [batch, num_main] or None
-                - 'ramp_actions': [batch, num_ramp] or None
-                - 'diverge_actions': [batch, num_diverge] or None
-                - 'value': [batch, 1]
+            state: [B, state_dim]
+            vehicle_observations: {'main': [B,N,8], ...}
+            action_dict: {'main_actions': [B,N], ...}
+            mask_dict: {'main': [B,N], ...}
         """
-        batch_size = state.size(0)
-        device = state.device
+        mask_dict = mask_dict or {}
 
-        results = {}
-        values = []
+        main_eval = self.main_controller.evaluate_actions_batched(
+            state,
+            vehicle_observations.get('main'),
+            action_dict.get('main_actions'),
+            mask_dict.get('main')
+        )
+        ramp_eval = self.ramp_controller.evaluate_actions_batched(
+            state,
+            vehicle_observations.get('ramp'),
+            action_dict.get('ramp_actions'),
+            mask_dict.get('ramp')
+        )
+        diverge_eval = self.diverge_controller.evaluate_actions_batched(
+            state,
+            vehicle_observations.get('diverge'),
+            action_dict.get('diverge_actions'),
+            mask_dict.get('diverge')
+        )
 
-        # 处理主路车辆
-        if main_vehicles is not None and main_vehicles.size(1) > 0:
-            num_main = main_vehicles.size(1)
-            # 创建掩码（假设所有位置都有效，可以根据需要调整）
-            main_mask = torch.ones(batch_size, num_main, device=device)
+        log_prob_sum = main_eval['log_prob_sum'] + ramp_eval['log_prob_sum'] + diverge_eval['log_prob_sum']
+        entropy_mean = (main_eval['entropy_mean'] + ramp_eval['entropy_mean'] + diverge_eval['entropy_mean']) / 3.0
+        value = (main_eval['value'] + ramp_eval['value'] + diverge_eval['value']) / 3.0
 
-            main_actions, main_value = self.main_controller(
-                state, main_vehicles, main_mask
-            )
-            results['main_actions'] = main_actions
-            values.append(main_value)
-        else:
-            results['main_actions'] = None
-
-        # 处理匝道车辆
-        if ramp_vehicles is not None and ramp_vehicles.size(1) > 0:
-            num_ramp = ramp_vehicles.size(1)
-            ramp_mask = torch.ones(batch_size, num_ramp, device=device)
-
-            ramp_actions, ramp_value = self.ramp_controller(
-                state, ramp_vehicles, ramp_mask
-            )
-            results['ramp_actions'] = ramp_actions
-            values.append(ramp_value)
-        else:
-            results['ramp_actions'] = None
-
-        # 处理分流车辆
-        if diverge_vehicles is not None and diverge_vehicles.size(1) > 0:
-            num_diverge = diverge_vehicles.size(1)
-            diverge_mask = torch.ones(batch_size, num_diverge, device=device)
-
-            diverge_actions, diverge_value = self.diverge_controller(
-                state, diverge_vehicles, diverge_mask
-            )
-            results['diverge_actions'] = diverge_actions
-            values.append(diverge_value)
-        else:
-            results['diverge_actions'] = None
-
-        # 聚合价值（取平均）
-        if values:
-            results['value'] = torch.stack(values, dim=0).mean(dim=0)
-        else:
-            results['value'] = torch.zeros(batch_size, 1, device=device)
-
-        return results
-
-
-# 测试代码
-if __name__ == '__main__':
-    # 创建测试数据
-    batch_size = 2
-    state_dim = 23
-    vehicle_feat_dim = 8
-
-    state = torch.randn(batch_size, state_dim)
-    main_vehicles = torch.randn(batch_size, 5, vehicle_feat_dim)  # 5辆主路车
-    ramp_vehicles = torch.randn(batch_size, 3, vehicle_feat_dim)  # 3辆匝道车
-    diverge_vehicles = torch.randn(batch_size, 2, vehicle_feat_dim)  # 2辆分流车
-
-    # 创建网络
-    network = VehicleLevelJunctionNetwork()
-
-    # 前向传播
-    output = network(state, main_vehicles, ramp_vehicles, diverge_vehicles)
-
-    print("车辆级控制网络测试:")
-    print(f"  主路动作形状: {output['main_actions'].shape}")
-    print(f"  匝道动作形状: {output['ramp_actions'].shape}")
-    print(f"  分流动作形状: {output['diverge_actions'].shape}")
-    print(f"  价值形状: {output['value'].shape}")
-    print(f"  主路动作示例: {output['main_actions'][0]}")
-    print(f"  匝道动作示例: {output['ramp_actions'][0]}")
+        return {
+            'log_prob_sum': log_prob_sum,
+            'entropy_mean': entropy_mean,
+            'value': value,
+        }

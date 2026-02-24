@@ -80,12 +80,15 @@ class SpatialAttention(nn.Module):
             attended_main: [batch, feature_dim]
             attended_ramp: [batch, feature_dim]
         """
-        # 主路车辆关注匝道车辆
-        main_attended, _ = self.attention(main_features, ramp_features, ramp_features)
+        # 主路与匝道车辆组成联合上下文（每条车道都同时关注两条车道）
+        joint_features = torch.cat([main_features, ramp_features], dim=1)
+
+        # 主路车辆关注联合上下文
+        main_attended, _ = self.attention(main_features, joint_features, joint_features)
         main_attended = self.norm(main_features + main_attended)
         
-        # 匝道车辆关注主路车辆
-        ramp_attended, _ = self.attention(ramp_features, main_features, main_features)
+        # 匝道车辆关注联合上下文
+        ramp_attended, _ = self.attention(ramp_features, joint_features, joint_features)
         ramp_attended = self.norm(ramp_features + ramp_attended)
         
         # 聚合
@@ -371,24 +374,25 @@ class TypeBPolicyNetwork(nn.Module):
         ramp_att = torch.zeros(batch_size, 16, device=device)
         diverge_att = torch.zeros(batch_size, 16, device=device)
         
-        if main_vehicles is not None and ramp_vehicles is not None:
-            main_enc = self.vehicle_encoder(main_vehicles)
-            ramp_enc = self.vehicle_encoder(ramp_vehicles)
-            
-            # 主路-匝道注意力
-            main_att, _ = self.tri_attention['main_to_ramp'](main_enc, ramp_enc, ramp_enc)
-            ramp_att, _ = self.tri_attention['ramp_to_main'](ramp_enc, main_enc, main_enc)
-            
-            main_att = main_att.mean(dim=1)
-            ramp_att = ramp_att.mean(dim=1)
-        
-        if diverge_vehicles is not None and main_vehicles is not None:
-            diverge_enc = self.vehicle_encoder(diverge_vehicles)
-            main_enc = self.vehicle_encoder(main_vehicles)
-            
-            # 主路-转出注意力
-            diverge_att, _ = self.tri_attention['diverge_to_main'](diverge_enc, main_enc, main_enc)
-            diverge_att = diverge_att.mean(dim=1)
+        main_enc = self.vehicle_encoder(main_vehicles) if main_vehicles is not None else None
+        ramp_enc = self.vehicle_encoder(ramp_vehicles) if ramp_vehicles is not None else None
+        diverge_enc = self.vehicle_encoder(diverge_vehicles) if diverge_vehicles is not None else None
+
+        # 联合车流上下文（每类车辆都看主路+匝道+转出的联合上下文）
+        context_parts = [enc for enc in [main_enc, ramp_enc, diverge_enc] if enc is not None]
+        joint_context = torch.cat(context_parts, dim=1) if context_parts else None
+
+        if main_enc is not None and joint_context is not None:
+            main_att_out, _ = self.tri_attention['main_to_ramp'](main_enc, joint_context, joint_context)
+            main_att = main_att_out.mean(dim=1)
+
+        if ramp_enc is not None and joint_context is not None:
+            ramp_att_out, _ = self.tri_attention['ramp_to_main'](ramp_enc, joint_context, joint_context)
+            ramp_att = ramp_att_out.mean(dim=1)
+
+        if diverge_enc is not None and joint_context is not None:
+            diverge_att_out, _ = self.tri_attention['diverge_to_main'](diverge_enc, joint_context, joint_context)
+            diverge_att = diverge_att_out.mean(dim=1)
         
         # 冲突预测
         merge_conflict = self.merge_conflict(state_features, ramp_att)
@@ -774,7 +778,7 @@ class VehicleLevelMultiJunctionModel(nn.Module):
 
             # 调用车辆级网络
             network = self.networks[junc_id]
-            output = network(state, main_veh, ramp_veh, diverge_veh)
+            output = network(state, main_veh, ramp_veh, diverge_veh, deterministic=deterministic)
 
             # 转换输出格式
             actions = {}
@@ -787,7 +791,17 @@ class VehicleLevelMultiJunctionModel(nn.Module):
 
             all_actions[junc_id] = actions
             all_values[junc_id] = output['value']
-            all_info[junc_id] = {}
+            all_info[junc_id] = {
+                'main_log_probs': output.get('main_log_probs'),
+                'ramp_log_probs': output.get('ramp_log_probs'),
+                'diverge_log_probs': output.get('diverge_log_probs'),
+                'main_entropies': output.get('main_entropies'),
+                'ramp_entropies': output.get('ramp_entropies'),
+                'diverge_entropies': output.get('diverge_entropies'),
+                'main_logits': output.get('main_logits'),
+                'ramp_logits': output.get('ramp_logits'),
+                'diverge_logits': output.get('diverge_logits'),
+            }
 
         return all_actions, all_values, all_info
 

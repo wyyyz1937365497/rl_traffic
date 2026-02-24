@@ -14,64 +14,22 @@ from enum import Enum
 from collections import defaultdict
 import numpy as np
 
-# --- 1. 导入逻辑，支持 libsumo ---
-if os.environ.get("USE_LIBSUMO", "0") == "1":
-    try:
-        import libsumo as traci
-        print("成功加载 libsumo 作为 traci 后端")
-    except ImportError:
-        print("未找到 libsumo，回退到 traci")
-        import traci
-else:
-    try:
-        import traci
-    except ImportError:
-        pass
+# --- 1. 导入逻辑：仅使用 libsumo ---
+TRACI_BACKEND = "libsumo"
+try:
+    import libsumo as traci
+    from libsumo import constants as tc
+    print("成功加载 libsumo 后端")
+except ImportError:
+    print("未找到 libsumo，请先安装/配置 SUMO 的 libsumo Python 绑定")
+    sys.exit(1)
 
 try:
     import sumolib
-    import traci.constants as tc
 except ImportError:
-    print("请安装traci和sumolib: pip install traci sumolib")
+    print("请安装sumolib: pip install sumolib")
     sys.exit(1)
 
-# # --- 2. 核心修复：强制常量定义 (解决所有 AttributeError 和类型错误) ---
-# # 不管原有定义如何，强制覆盖为正确的 TraCI 协议值
-
-# # A. 边/车道订阅相关
-# tc.LAST_STEP_VEHICLE_ID_LIST = 0x13          # 【关键修复】强制设为 0x13 (车辆ID列表)，防止取到速度(0x12)
-# tc.LAST_STEP_VEHICLE_NUMBER = 0x11       # 车辆数量
-# tc.LAST_STEP_MEAN_SPEED = 0x12           # 平均速度
-# tc.LAST_STEP_VEHICLE_NUMBER = 0x10       # 停止车辆数
-# tc.LAST_STEP_OCCUPANCY = 0x14            # 占有率
-
-# # B. 车辆订阅相关
-# tc.VAR_SPEED = 0x40
-# tc.VAR_POSITION = 0x42
-# tc.VAR_LANEPOSITION = 0x56               # 【关键修复】无下划线版本
-# tc.VAR_LANE_POSITION = 0x56              # 兼容有下划线版本
-# tc.VAR_LANE_INDEX = 0x53
-# tc.VAR_ROAD_ID = 0x50
-# tc.VAR_ROUTE_INDEX = 0x69
-# tc.VAR_WAITING_TIME = 0x7a
-# tc.VAR_ACCELERATION = 0x46
-# tc.VAR_VEHICLECLASS = 0x49
-# tc.VAR_TYPE = 0x03
-
-# # C. 信号灯订阅相关
-# tc.TL_CURRENT_PHASE = 0x50
-# tc.VAR_TL_RED_YELLOW_GREEN_STATE = 0x59
-# tc.VAR_TL_NEXT_SWITCH = 0x5a
-# # 兼容旧版命名
-# tc.LAST_STEP_TLS_CURRENT_PHASE = 0x50
-# tc.LAST_STEP_TLS_CURRENT_PHASE = 0x51
-# tc.LAST_STEP_TLS_PHASE_DURATION = 0x54
-# tc.LAST_STEP_TLS_NEXT_SWITCH = 0x5a
-# tc.LAST_STEP_TLS_RED_YELLOW_GREEN_STATE = 0x59
-# tc.LAST_STEP_TLS_CONTROLLED_LANES = 0x5b
-# tc.LAST_STEP_TLS_CONTROLLED_LINKS = 0x5c
-
-# ------------------------------------------------
 
 
 class JunctionType(Enum):
@@ -1066,8 +1024,26 @@ class MultiAgentEnvironment:
                     default_junction = self.junction_ids[0] if self.junction_ids else 'J14'
                     self._global_cv_assignment[veh_id] = default_junction
 
-            # 调试：第一次分配时打印详细统计
-            if not hasattr(self, '_cv_assignment_printed'):
+            # 训练过程监控：每300步打印一次CV分配情况
+            if self.current_step > 0 and self.current_step % 300 == 0:
+                junction_stats_periodic = {}
+                for assigned_junc in self._global_cv_assignment.values():
+                    junction_stats_periodic[assigned_junc] = junction_stats_periodic.get(assigned_junc, 0) + 1
+
+                if junction_stats_periodic:
+                    parts = [f"{junc_id}:{junction_stats_periodic[junc_id]}" for junc_id in sorted(junction_stats_periodic.keys())]
+                    stats_text = ", ".join(parts)
+                else:
+                    stats_text = "无CV车辆"
+
+                print(
+                    f"[CV分配监控] step={self.current_step} "
+                    f"total_cv={len(all_cv_vehicles)} assigned={len(self._global_cv_assignment)} "
+                    f"{stats_text}"
+                )
+
+            # 调试：首次检测到CV车辆时打印详细统计
+            if len(all_cv_vehicles) > 0 and not hasattr(self, '_cv_assignment_printed'):
                 self._cv_assignment_printed = True
 
                 # 统计每个路口的车辆分布
@@ -1231,6 +1207,11 @@ class MultiAgentEnvironment:
                 print(f"关闭已有TraCI连接失败: {e}")
         
         sumo_binary = "sumo-gui" if self.use_gui else "sumo"
+        print(
+            f"[SUMO后端] backend={TRACI_BACKEND}, "
+            f"USE_LIBSUMO={os.environ.get('USE_LIBSUMO', '1')}, "
+            f"binary={sumo_binary}"
+        )
         sumo_cmd = [
             sumo_binary,
             "-c", self.sumo_cfg,
@@ -1416,8 +1397,6 @@ class MultiAgentEnvironment:
     def _compute_current_ocr(self) -> float:
         """计算当前OCR"""
         try:
-            import traci
-
             # 到达车辆数
             arrived = traci.simulation.getArrivedNumber()
 

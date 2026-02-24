@@ -7,8 +7,9 @@ import os
 import sys
 import time
 import json
+import random
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 from datetime import datetime
 import argparse
 import logging
@@ -31,10 +32,9 @@ if sys.platform == 'win32':
 
 sys.path.insert(0, '.')
 
-from junction_agent import JUNCTION_CONFIGS, JunctionAgent, MultiAgentEnvironment
+from junction_agent import JUNCTION_CONFIGS, JunctionAgent, MultiAgentEnvironment, traci
 from junction_network import VehicleLevelMultiJunctionModel, NetworkConfig
 from junction_trainer import PPOConfig, ExperienceBuffer
-from vehicle_type_config import normalize_speed, get_vehicle_max_speed
 
 
 class PPOFinetuner:
@@ -88,13 +88,6 @@ class PPOFinetuner:
             eps=1e-5
         )
 
-        # 步骤3: 创建value网络优化器
-        self.value_optimizer = optim.Adam(
-            self.model.parameters(),
-            lr=self.config.lr,
-            eps=1e-5
-        )
-
         logging.info(f"[优化器] 学习率: {self.config.lr}")
 
         # 步骤4: TensorBoard
@@ -104,9 +97,25 @@ class PPOFinetuner:
         self.episode_stats = []
         self.best_reward = float('-inf')
         self.global_step = 0
+        self.entropy_coef = self.config.entropy_coef
+        self.cumulative_departed = 0
+        self.cumulative_arrived = 0
+        self.value_clip_epsilon = 0.2
 
         logging.info("=" * 70)
         logging.info("初始化完成\n")
+
+    def _pin_if_cpu(self, tensor: torch.Tensor) -> torch.Tensor:
+        """对CPU tensor进行pin_memory，便于异步传输"""
+        if torch.is_tensor(tensor) and tensor.device.type == 'cpu':
+            return tensor.pin_memory()
+        return tensor
+
+    def _to_device_async(self, tensor: torch.Tensor) -> torch.Tensor:
+        """异步传输到训练设备"""
+        if not torch.is_tensor(tensor):
+            return tensor
+        return tensor.to(self.device, non_blocking=True)
 
     def _setup_logging(self):
         """配置日志"""
@@ -149,14 +158,22 @@ class PPOFinetuner:
         else:
             state_dict = checkpoint
 
+        # 兼容包装器前缀（例如 network.xxx）
+        normalized_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('network.'):
+                normalized_state_dict[key[len('network.'):]] = value
+            else:
+                normalized_state_dict[key] = value
+
         # 加载权重（允许部分加载）
         model_state = model.state_dict()
 
         # 调试：打印前5个key
-        logging.info(f"  Checkpoint keys (前5个): {list(state_dict.keys())[:5]}")
+        logging.info(f"  Checkpoint keys (前5个): {list(normalized_state_dict.keys())[:5]}")
         logging.info(f"  Model keys (前5个): {list(model_state.keys())[:5]}")
 
-        pretrained_dict = {k: v for k, v in state_dict.items() if k in model_state and model_state[k].shape == v.shape}
+        pretrained_dict = {k: v for k, v in normalized_state_dict.items() if k in model_state and model_state[k].shape == v.shape}
 
         model.load_state_dict(pretrained_dict, strict=False)
         model = model.to(device)
@@ -378,6 +395,7 @@ class PPOFinetuner:
             'stability_speed': stability_speed_reward,
             'stability_accel': stability_accel_reward,
             'ocr_reward': ocr_reward,
+            'safety_penalty': safety_penalty,
             'collision_penalty': collision_penalty,
             'emergency_stop_penalty': emergency_stop_penalty,
             'slow_penalty': slow_penalty,
@@ -386,6 +404,93 @@ class PPOFinetuner:
         }
 
         return breakdown['total'], breakdown
+
+    def _extract_vehicle_features(self, veh_ids: List[str]) -> np.ndarray:
+        """提取车辆特征 [N, 8]（与BC训练保持一致）"""
+        features = []
+        for veh_id in veh_ids:
+            try:
+                speed = traci.vehicle.getSpeed(veh_id)
+                lane_pos = traci.vehicle.getLanePosition(veh_id)
+                lane_idx = traci.vehicle.getLaneIndex(veh_id)
+                waiting_time = traci.vehicle.getWaitingTime(veh_id)
+                accel = traci.vehicle.getAcceleration(veh_id)
+                veh_type = traci.vehicle.getTypeID(veh_id)
+                route_index = traci.vehicle.getRouteIndex(veh_id)
+
+                feat = [
+                    speed / 20.0,
+                    lane_pos / 500.0,
+                    lane_idx / 3.0,
+                    waiting_time / 60.0,
+                    accel / 5.0,
+                    1.0 if veh_type == 'CV' else 0.0,
+                    route_index / 10.0,
+                    0.0
+                ]
+                features.append(feat)
+            except Exception:
+                continue
+
+        if not features:
+            return np.zeros((0, 8), dtype=np.float32)
+
+        return np.array(features, dtype=np.float32)
+
+    def _build_step_info(self, env_info: Dict[str, Any]) -> Dict[str, Any]:
+        """构建奖励所需的环境统计信息"""
+        try:
+            vehicle_ids = list(traci.vehicle.getIDList())
+        except Exception:
+            vehicle_ids = []
+
+        speeds = []
+        accelerations = []
+        for veh_id in vehicle_ids:
+            try:
+                speeds.append(float(traci.vehicle.getSpeed(veh_id)))
+                accelerations.append(float(traci.vehicle.getAcceleration(veh_id)))
+            except Exception:
+                continue
+
+        # 使用仿真真实统计，累计到episode级别
+        try:
+            step_departed = int(traci.simulation.getDepartedNumber())
+        except Exception:
+            step_departed = 0
+
+        try:
+            step_arrived = int(traci.simulation.getArrivedNumber())
+        except Exception:
+            step_arrived = 0
+
+        try:
+            # 当前步发生碰撞的车辆数（非累计）
+            num_collisions = int(traci.simulation.getCollidingVehiclesNumber())
+        except Exception:
+            num_collisions = 0
+
+        try:
+            # 当前步急停车辆数（非累计）
+            num_emergency_stops = int(traci.simulation.getEmergencyStoppingVehiclesNumber())
+        except Exception:
+            num_emergency_stops = 0
+
+        self.cumulative_departed += step_departed
+        self.cumulative_arrived += step_arrived
+
+        num_departed = self.cumulative_departed
+        num_arrived = self.cumulative_arrived
+
+        return {
+            'speeds': speeds,
+            'accelerations': accelerations,
+            'num_departed': num_departed,
+            'num_arrived': num_arrived,
+            'num_active': len(vehicle_ids),
+            'num_collisions': num_collisions,
+            'num_emergency_stops': num_emergency_stops,
+        }
 
     def _build_model_inputs(self, env: MultiAgentEnvironment, state_vectors: Dict[str, np.ndarray]):
         """
@@ -398,11 +503,11 @@ class PPOFinetuner:
         Returns:
             junction_observations: Dict[junc_id, torch.Tensor]
             vehicle_observations: Dict[junc_id, Dict[str, torch.Tensor]]
+            controlled_map: Dict[junc_id, Dict[str, List[str]]]
         """
-        import traci
-
         junction_observations = {}
         vehicle_observations = {}
+        controlled_map = {}
 
         try:
             for junc_id, state_vec in state_vectors.items():
@@ -415,28 +520,29 @@ class PPOFinetuner:
 
                 agent = env.agents[junc_id]
 
-                # 获取受控车辆（复用generate_submit_bc.py的逻辑）
+                # 获取受控车辆
                 try:
-                    controlled, vehicle_features = agent._get_controlled_vehicles()
+                    controlled = agent.get_controlled_vehicles()
+                    controlled_map[junc_id] = controlled
 
                     # 构建vehicle_observations
                     veh_obs_dict = {}
                     for veh_type in ['main', 'ramp', 'diverge']:
-                        if veh_type in vehicle_features and vehicle_features[veh_type] is not None:
-                            # 转换为tensor
-                            feats = vehicle_features[veh_type]
-                            if len(feats) > 0:
-                                veh_obs_dict[veh_type] = torch.tensor(feats, dtype=torch.float32).unsqueeze(0).to(self.device)
+                        veh_ids = controlled.get(veh_type, [])
+                        feats = self._extract_vehicle_features(veh_ids)
+                        if len(feats) > 0:
+                            veh_obs_dict[veh_type] = torch.tensor(feats, dtype=torch.float32).unsqueeze(0).to(self.device)
 
                     vehicle_observations[junc_id] = veh_obs_dict
-                except Exception as e:
+                except Exception:
                     # 如果获取失败，使用空字典
                     vehicle_observations[junc_id] = {}
+                    controlled_map[junc_id] = {'main': [], 'ramp': [], 'diverge': []}
 
         except Exception as e:
             logging.warning(f"构建模型输入时出错: {e}")
 
-        return junction_observations, vehicle_observations
+        return junction_observations, vehicle_observations, controlled_map
 
     def collect_episode(self, env: MultiAgentEnvironment, max_steps: int = 3600) -> Dict:
         """
@@ -458,34 +564,46 @@ class PPOFinetuner:
 
         # 重置环境
         state_vectors = env.reset()  # Dict[junc_id, np.ndarray]
+        self.cumulative_departed = 0
+        self.cumulative_arrived = 0
 
         for step in tqdm(range(max_steps), desc="收集episode"):
             # 构建模型输入（包含车辆观测）
-            junction_observations, vehicle_observations = self._build_model_inputs(env, state_vectors)
+            junction_observations, vehicle_observations, controlled_map = self._build_model_inputs(env, state_vectors)
 
             # 选择动作
             with torch.no_grad():
-                actions, log_probs, values = self._select_actions(junction_observations, vehicle_observations)
+                env_actions, policy_actions, log_probs, values = self._select_actions(
+                    junction_observations,
+                    vehicle_observations,
+                    controlled_map
+                )
 
             # 执行动作
-            next_state_vectors, rewards, dones, info = env.step(actions)
+            next_state_vectors, rewards, dones, info = env.step(env_actions)
 
             # 计算奖励（带分解）
-            reward, breakdown = self.compute_reward_with_breakdown(info)
+            step_info = self._build_step_info(info)
+            reward, breakdown = self.compute_reward_with_breakdown(step_info)
             episode_reward += reward
             episode_rewards.append(reward)
             reward_breakdowns.append(breakdown)
 
-            # 存储经验（存储原始状态向量）
-            for junc_id, state_vec in state_vectors.items():
-                if junc_id in actions:
-                    # 转换为tensor
-                    state_tensor = torch.tensor(state_vec, dtype=torch.float32).to(self.device)
+            # 存储经验（包含车辆状态与真实log_prob）
+            for junc_id, state_tensor in junction_observations.items():
+                if junc_id in policy_actions:
+                    vehicle_state = {
+                        veh_type: self._pin_if_cpu(tensor.detach().cpu())
+                        for veh_type, tensor in vehicle_observations.get(junc_id, {}).items()
+                    }
                     buffer.add(
                         junction_id=junc_id,
-                        state=state_tensor,
-                        vehicle_state={},  # 简化，暂不存储车辆状态
-                        action=actions[junc_id],
+                        state=self._pin_if_cpu(state_tensor.squeeze(0).detach().cpu()),
+                        vehicle_state=vehicle_state,
+                        action={
+                            key: self._pin_if_cpu(value.detach().cpu())
+                            for key, value in policy_actions[junc_id].items()
+                        },
                         reward=reward,
                         value=values.get(junc_id, 0.0),
                         log_prob=log_probs.get(junc_id, 0.0),
@@ -532,7 +650,12 @@ class PPOFinetuner:
 
         return episode_data
 
-    def _select_actions(self, junction_observations: Dict, vehicle_observations: Dict) -> Tuple[Dict, Dict, Dict]:
+    def _select_actions(
+        self,
+        junction_observations: Dict,
+        vehicle_observations: Dict,
+        controlled_map: Dict[str, Dict[str, List[str]]]
+    ) -> Tuple[Dict, Dict, Dict, Dict]:
         """
         选择动作（车辆级模型）
 
@@ -541,17 +664,19 @@ class PPOFinetuner:
             vehicle_observations: Dict[junc_id, Dict[str, torch.Tensor]]
 
         Returns:
-            actions: {junction_id: action_dict}
+            env_actions: {junction_id: {veh_id: speed_ratio}}
+            policy_actions: {junction_id: model_action_tensors}
             log_probs: {junction_id: log_prob}
             values: {junction_id: value}
         """
-        actions = {}
+        env_actions = {}
+        policy_actions = {}
         log_probs = {}
         values = {}
 
         # 模型推理
         with torch.no_grad():
-            all_actions, all_values, _ = self.model(
+            all_actions, all_values, all_info = self.model(
                 junction_observations,
                 vehicle_observations,
                 deterministic=False  # 采样
@@ -559,11 +684,154 @@ class PPOFinetuner:
 
         # 提取动作和values
         for junc_id, output in all_actions.items():
-            actions[junc_id] = output
-            values[junc_id] = all_values.get(junc_id, 0.0).item() if torch.is_tensor(all_values.get(junc_id, 0.0)) else all_values.get(junc_id, 0.0)
-            log_probs[junc_id] = 0.0  # 简化，实际应该从分布中采样
+            junc_env_actions = {}
+            controlled = controlled_map.get(junc_id, {'main': [], 'ramp': [], 'diverge': []})
 
-        return actions, log_probs, values
+            for veh_type in ['main', 'ramp', 'diverge']:
+                action_key = f'{veh_type}_actions'
+                veh_ids = controlled.get(veh_type, [])
+                veh_actions = output.get(action_key)
+
+                if veh_actions is None:
+                    continue
+
+                if veh_actions.dim() > 1:
+                    veh_actions = veh_actions.squeeze(0)
+
+                n = min(len(veh_ids), veh_actions.shape[0])
+                for i in range(n):
+                    junc_env_actions[veh_ids[i]] = float(torch.clamp(veh_actions[i], 0.0, 1.0).item())
+
+            env_actions[junc_id] = junc_env_actions
+            policy_actions[junc_id] = {
+                k: v for k, v in output.items()
+                if k in ['main_actions', 'ramp_actions', 'diverge_actions'] and v is not None
+            }
+
+            values[junc_id] = all_values.get(junc_id, 0.0).item() if torch.is_tensor(all_values.get(junc_id, 0.0)) else all_values.get(junc_id, 0.0)
+            log_prob_sum = 0.0
+            info = all_info.get(junc_id, {})
+            for key in ['main_log_probs', 'ramp_log_probs', 'diverge_log_probs']:
+                val = info.get(key)
+                if torch.is_tensor(val):
+                    log_prob_sum += float(val.sum().item())
+            log_probs[junc_id] = log_prob_sum
+
+        return env_actions, policy_actions, log_probs, values
+
+    def _build_padded_type_batch(
+        self,
+        samples: List[Dict],
+        veh_type: str,
+        action_key: str
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """构建某车辆类型的padding batch [B, N, ...] + mask"""
+        veh_tensors = []
+        act_tensors = []
+        max_len = 0
+
+        for sample in samples:
+            veh = sample['vehicle_state'].get(veh_type)
+            act = sample['action'].get(action_key)
+
+            if veh is None or act is None:
+                veh_len = 0
+                veh = None
+                act = None
+            else:
+                if veh.dim() == 3:
+                    veh = veh.squeeze(0)
+                if act.dim() > 1:
+                    act = act.squeeze(0)
+                veh_len = int(min(veh.size(0), act.size(0)))
+
+            max_len = max(max_len, veh_len)
+            veh_tensors.append((veh, veh_len))
+            act_tensors.append((act, veh_len))
+
+        if max_len == 0:
+            return None, None, None
+
+        batch_size = len(samples)
+        feat_dim = 8
+
+        vehicles_batch = torch.zeros(batch_size, max_len, feat_dim, dtype=torch.float32)
+        actions_batch = torch.zeros(batch_size, max_len, dtype=torch.float32)
+        mask_batch = torch.zeros(batch_size, max_len, dtype=torch.float32)
+
+        for i in range(batch_size):
+            veh, n_v = veh_tensors[i]
+            act, n_a = act_tensors[i]
+            n = min(n_v, n_a)
+            if n <= 0:
+                continue
+            vehicles_batch[i, :n] = veh[:n].float()
+            actions_batch[i, :n] = act[:n].float()
+            mask_batch[i, :n] = 1.0
+
+        if self.device.startswith('cuda'):
+            vehicles_batch = vehicles_batch.pin_memory()
+            actions_batch = actions_batch.pin_memory()
+            mask_batch = mask_batch.pin_memory()
+
+        return (
+            self._to_device_async(vehicles_batch),
+            self._to_device_async(actions_batch),
+            self._to_device_async(mask_batch),
+        )
+
+    def _evaluate_batch(self, samples: List[Dict]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """批量评估一批sample（按junction分组，组内向量化）"""
+        if not samples:
+            zero = torch.zeros(0, device=self.device)
+            return zero, zero, zero
+
+        grouped = {}
+        for idx, sample in enumerate(samples):
+            grouped.setdefault(sample['junction_id'], []).append((idx, sample))
+
+        batch_size = len(samples)
+        logp_out = torch.zeros(batch_size, device=self.device)
+        value_out = torch.zeros(batch_size, device=self.device)
+        entropy_out = torch.zeros(batch_size, device=self.device)
+
+        for junc_id, idx_samples in grouped.items():
+            network = self.model.networks[junc_id]
+            local_indices = [pair[0] for pair in idx_samples]
+            local_samples = [pair[1] for pair in idx_samples]
+
+            states_cpu = torch.stack([s['state'].float() for s in local_samples], dim=0)
+            if self.device.startswith('cuda'):
+                states_cpu = states_cpu.pin_memory()
+            states = self._to_device_async(states_cpu)
+
+            main_pack = self._build_padded_type_batch(local_samples, 'main', 'main_actions')
+            ramp_pack = self._build_padded_type_batch(local_samples, 'ramp', 'ramp_actions')
+            diverge_pack = self._build_padded_type_batch(local_samples, 'diverge', 'diverge_actions')
+
+            veh_obs = {
+                'main': main_pack[0] if main_pack[0] is not None else None,
+                'ramp': ramp_pack[0] if ramp_pack[0] is not None else None,
+                'diverge': diverge_pack[0] if diverge_pack[0] is not None else None,
+            }
+            act_dict = {
+                'main_actions': main_pack[1] if main_pack[1] is not None else None,
+                'ramp_actions': ramp_pack[1] if ramp_pack[1] is not None else None,
+                'diverge_actions': diverge_pack[1] if diverge_pack[1] is not None else None,
+            }
+            mask_dict = {
+                'main': main_pack[2] if main_pack[2] is not None else None,
+                'ramp': ramp_pack[2] if ramp_pack[2] is not None else None,
+                'diverge': diverge_pack[2] if diverge_pack[2] is not None else None,
+            }
+
+            eval_out = network.evaluate_actions_batched(states, veh_obs, act_dict, mask_dict)
+            idx_tensor = torch.tensor(local_indices, dtype=torch.long, device=self.device)
+            logp_out[idx_tensor] = eval_out['log_prob_sum']
+            value_out[idx_tensor] = eval_out['value']
+            entropy_out[idx_tensor] = eval_out['entropy_mean']
+
+        return logp_out, value_out, entropy_out
 
     def update_policy(self, buffer: ExperienceBuffer) -> Dict:
         """
@@ -577,8 +845,43 @@ class PPOFinetuner:
         """
         self.model.train()
 
+        if len(buffer) == 0:
+            return {
+                'policy_loss': 0.0,
+                'value_loss': 0.0,
+                'entropy': 0.0,
+            }
+
         # 计算GAE
         advantages, returns = self._compute_gae(buffer)
+
+        samples = []
+        for junc_id in buffer.states:
+            n = len(buffer.states[junc_id])
+            for i in range(n):
+                samples.append({
+                    'junction_id': junc_id,
+                    'state': buffer.states[junc_id][i],
+                    'vehicle_state': buffer.vehicle_states[junc_id][i],
+                    'action': buffer.actions[junc_id][i],
+                    'old_log_prob': float(buffer.log_probs[junc_id][i]),
+                    'old_value': float(buffer.values[junc_id][i]),
+                    'advantage': float(advantages[junc_id][i]),
+                    'return': float(returns[junc_id][i]),
+                })
+
+        if not samples:
+            return {
+                'policy_loss': 0.0,
+                'value_loss': 0.0,
+                'entropy': 0.0,
+            }
+
+        adv_tensor = torch.tensor([s['advantage'] for s in samples], dtype=torch.float32, device=self.device)
+        adv_mean = adv_tensor.mean()
+        adv_std = adv_tensor.std(unbiased=False) + 1e-8
+        for idx, sample in enumerate(samples):
+            sample['advantage'] = float(((adv_tensor[idx] - adv_mean) / adv_std).item())
 
         total_policy_loss = 0.0
         total_value_loss = 0.0
@@ -586,10 +889,66 @@ class PPOFinetuner:
         num_updates = 0
 
         # 多个epoch更新
+        batch_size = min(self.config.batch_size, len(samples))
         for epoch in range(self.config.n_epochs):
-            # TODO: 实现完整的PPO更新循环
-            # 这里需要根据实际模型架构实现
-            pass
+            random.shuffle(samples)
+
+            for start in range(0, len(samples), batch_size):
+                batch = samples[start:start + batch_size]
+
+                new_log_probs, new_values, entropies = self._evaluate_batch(batch)
+
+                old_log_probs = torch.tensor(
+                    [sample['old_log_prob'] for sample in batch],
+                    dtype=torch.float32,
+                    device=self.device
+                )
+                old_values = torch.tensor(
+                    [sample['old_value'] for sample in batch],
+                    dtype=torch.float32,
+                    device=self.device
+                )
+                advantages_batch = torch.tensor(
+                    [sample['advantage'] for sample in batch],
+                    dtype=torch.float32,
+                    device=self.device
+                )
+                returns_batch = torch.tensor(
+                    [sample['return'] for sample in batch],
+                    dtype=torch.float32,
+                    device=self.device
+                )
+
+                # return标准化（批内）
+                returns_batch = (returns_batch - returns_batch.mean()) / (returns_batch.std(unbiased=False) + 1e-8)
+
+                ratio = torch.exp(new_log_probs - old_log_probs)
+                surr1 = ratio * advantages_batch
+                surr2 = torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon) * advantages_batch
+
+                policy_loss = -torch.min(surr1, surr2).mean()
+                # PPO式value clipping + Huber损失
+                values_clipped = old_values + torch.clamp(
+                    new_values - old_values,
+                    -self.value_clip_epsilon,
+                    self.value_clip_epsilon
+                )
+                value_loss_unclipped = nn.functional.smooth_l1_loss(new_values, returns_batch, reduction='none')
+                value_loss_clipped = nn.functional.smooth_l1_loss(values_clipped, returns_batch, reduction='none')
+                value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
+                entropy = entropies.mean()
+
+                loss = policy_loss + self.config.value_coef * value_loss - self.entropy_coef * entropy
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.optimizer.step()
+
+                total_policy_loss += float(policy_loss.item())
+                total_value_loss += float(value_loss.item())
+                total_entropy += float(entropy.item())
+                num_updates += 1
 
         metrics = {
             'policy_loss': total_policy_loss / max(num_updates, 1),
@@ -613,20 +972,29 @@ class PPOFinetuner:
         for junc_id in buffer.states:
             rewards = buffer.rewards.get(junc_id, [])
             values = buffer.values.get(junc_id, [])
-            dones = buffer.dones
 
-            # 计算returns
-            returns_junc = []
-            R = 0
+            if not rewards:
+                advantages[junc_id] = []
+                returns[junc_id] = []
+                continue
+
+            dones = [False] * len(rewards)
+            dones[-1] = True
+
+            values_ext = values + [0.0]
+            gae = 0.0
+            adv_junc = [0.0] * len(rewards)
+            ret_junc = [0.0] * len(rewards)
+
             for i in reversed(range(len(rewards))):
-                R = rewards[i] + self.config.gamma * R * (0 if i < len(dones) and dones[i] else 1)
-                returns_junc.insert(0, R)
+                mask = 0.0 if dones[i] else 1.0
+                delta = rewards[i] + self.config.gamma * values_ext[i + 1] * mask - values_ext[i]
+                gae = delta + self.config.gamma * self.config.gae_lambda * mask * gae
+                adv_junc[i] = gae
+                ret_junc[i] = gae + values_ext[i]
 
-            returns[junc_id] = returns_junc
-
-            # 计算advantages (简化版)
-            advantages_junc = [r - v for r, v in zip(returns_junc, values)]
-            advantages[junc_id] = advantages_junc
+            advantages[junc_id] = adv_junc
+            returns[junc_id] = ret_junc
 
         return advantages, returns
 
@@ -714,7 +1082,6 @@ class PPOFinetuner:
             'episode': episode,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'value_optimizer_state_dict': self.value_optimizer.state_dict(),
             'reward': reward,
             'best_reward': self.best_reward,
             'config': self.config.__dict__,
