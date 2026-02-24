@@ -2,43 +2,72 @@
 
 ## 🎯 奖励函数设计
 
-改进的奖励函数优化以下指标：
+基于BC模型OCR已达0.93的观察，奖励函数优先级调整如下：
 
-### 1. OCR奖励（权重: 3.0）
-```python
-ocr_reward = 3.0 * (current_ocr / 0.94) ** 2
-```
-- 目标OCR: 0.94
-- 越接近目标，奖励越高
-- 鼓励车辆完成旅程
+### 1. ⭐ 流量奖励（权重: 4.5）- 最重要
 
-### 2. 流量奖励（权重: 2.0）
-```python
-speed_reward = 2.0 * (mean_speed / 13.89) ** 2
-traffic_reward = 0.5 * sqrt(num_active / 100.0)
-```
-- 速度奖励：鼓励高速（0-13.89 m/s）
-- 活跃车辆奖励：鼓励系统内有更多车辆运行
-- 反映交通吞吐量
+**优先级原因**：BC已有0.93 OCR，流量成为提升分数的关键
 
-### 3. 稳定性奖励（权重: 2.0）
 ```python
-stability_speed = 1.0 * max(0, 1.0 - speed_std / 8.0)
-stability_accel = 1.0 * max(0, 1.0 - mean_abs_accel / 1.2)
-```
-- 速度标准差：< 8 m/s（越低越好）
-- 加速度绝对值：< 1.2 m/s²（越低越好）
-- 减少急加减速
+# 速度奖励（权重3.0）
+speed_reward = 3.0 * (mean_speed / 13.89) ** 2
 
-### 4. 安全性惩罚（权重: -2.0）
-```python
-collision_penalty = -0.5 * num_collisions
-emergency_stop_penalty = -0.1 * num_emergency_stops
-slow_penalty = -1.0 * slow_ratio
+# 活跃车辆奖励（权重1.5）
+traffic_reward = 1.5 * (num_active / 500.0)
+
+throughput_reward = speed_reward + traffic_reward
 ```
-- 碰撞惩罚：每次碰撞-0.5分
-- 急停惩罚：每次-0.1分
-- 慢速惩罚：速度<3m/s的车辆比例
+
+- 速度奖励：平方项放大高速贡献，鼓励保持13.89 m/s（50 km/h）
+- 活跃车辆：系统内运行车辆越多越好（目标500辆）
+- 直接提升交通吞吐量
+
+### 2. ⭐ 稳定性奖励（权重: 3.0）- 第二优先
+
+```python
+# 速度稳定性（权重1.5）
+stability_speed = 1.5 * max(0, 1.0 - speed_std / 6.0)  # 目标: < 6 m/s
+
+# 加速度稳定性（权重1.5）
+stability_accel = 1.5 * max(0, 1.0 - mean_abs_accel / 1.0)  # 目标: < 1.0 m/s²
+```
+
+- 速度标准差目标：< 6 m/s（更严格）
+- 加速度目标：< 1.0 m/s²（更严格）
+- 减少急加减速，提升舒适度
+
+### 3. OCR奖励（权重: 2.0）- 第三优先
+
+**为什么降低权重**：BC已达0.93，提升空间有限
+
+```python
+if current_ocr >= 0.93:  # BC基准
+    ocr_reward = 2.0 * ((current_ocr - 0.93) / (0.965 - 0.93)) ** 2
+    ocr_reward = min(ocr_reward, 3.0)  # 上限3.0
+else:
+    ocr_reward = 2.0 * (current_ocr / 0.93)
+```
+
+- 目标OCR：0.965（提升到0.96-0.97范围）
+- 基准：0.93（BC已有水平）
+- 仅在超过基准时给予额外奖励
+
+### 4. 安全性惩罚（权重: -2.5）
+
+```python
+collision_penalty = -1.0 * num_collisions        # 每次-1.0
+emergency_stop_penalty = -0.2 * num_emergency_stops  # 每次-0.2
+slow_penalty = -1.5 * slow_ratio                 # 速度<3m/s的车辆比例
+jam_penalty = -0.5 * jam_ratio                   # 速度<5m/s的车辆比例
+```
+
+- 碰撞惩罚增强：-0.5 → -1.0
+- 慢速惩罚增强：-1.0 → -1.5
+- 新增拥堵惩罚：-0.5
+
+---
+
+**设计理念**：流量 > 稳定性 > OCR > 安全
 
 ---
 
@@ -111,15 +140,19 @@ python local_score_calculator.py submit_ppo_finetune.pkl
 
 ```
 [Episode] 总奖励: 3234.56
-[Episode] 平均奖励分解:
-  OCR奖励: 2.8456        # 主要贡献
-  速度奖励: 1.6543
-  流量奖励: 0.2345
-  稳定性(速度): 0.8765
-  稳定性(加速度): 0.6543
-  碰撞惩罚: -0.2500      # 碰撞少
-  急停惩罚: -0.0500
-  慢速惩罚: -0.1234
+[Episode] 平均奖励分解（流量优先版本）:
+  【流量奖励】总计: 2.3456 ⭐      # 主要贡献（速度+活跃车辆）
+    - 速度奖励: 1.8234
+    - 活跃车辆: 0.5222
+  【稳定性奖励】总计: 1.8765 ⭐
+    - 速度稳定性: 0.9456
+    - 加速度稳定性: 0.9309
+  【OCR奖励】: 1.2345            # 第三优先（目标0.965）
+  【安全性惩罚】: -0.5234
+    - 碰撞: -0.1000
+    - 急停: -0.0234
+    - 慢速: -0.2500
+    - 拥堵: -0.1500
 ```
 
 ### TensorBoard曲线
@@ -304,10 +337,17 @@ ls -lh ppo_finetune_checkpoints/
 
 ### 技巧2: 奖励 shaping
 
-如果某个指标不达标，调整权重：
+如果某个指标不达标，在`compute_reward()`中调整权重：
+
 ```python
-# 在compute_reward()中修改权重
-ocr_reward = 5.0 * (current_ocr / 0.94) ** 2  # 从3.0增加到5.0
+# 例如：如果速度太慢，增强速度奖励
+speed_reward = 5.0 * (mean_speed / 13.89) ** 2  # 从3.0增加到5.0
+
+# 如果拥堵严重，增强拥堵惩罚
+jam_penalty = -1.0 * jam_ratio  # 从-0.5增加到-1.0
+
+# 如果OCR不达标（<0.96），提高OCR权重
+ocr_reward = 3.0 * ((current_ocr - 0.93) / (0.965 - 0.93)) ** 2  # 从2.0增加
 ```
 
 ### 技巧3: 多次训练
@@ -341,4 +381,4 @@ done
 ---
 
 **最后更新**: 2026-02-24
-**版本**: v2.0 - 改进奖励函数
+**版本**: v3.0 - 流量优先奖励函数
