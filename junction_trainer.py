@@ -30,7 +30,7 @@ class PPOConfig:
     """PPO配置"""
     # 学习率
     lr: float = 3e-4
-    
+
     # PPO参数
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -38,15 +38,18 @@ class PPOConfig:
     entropy_coef: float = 0.01
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
-    
+
     # 训练参数
     batch_size: int = 2048  # 增大到2048以充分利用GPU并行能力
     n_epochs: int = 8  # 增加epoch次数（从5提高到8），提高策略优化程度
     update_frequency: int = 2048  # 减小更新频率，使策略更新更及时
-    
+
     # 探索
     entropy_decay: float = 0.9995  # 减慢衰减（从0.999提高到0.9995）
     entropy_min: float = 0.005     # 提高最小值（从0.001提高到0.005）
+
+    # 随机种子
+    seed: int = 42
 
 
 @dataclass

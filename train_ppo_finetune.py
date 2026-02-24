@@ -574,7 +574,12 @@ class PPOFinetuner:
         logging.info("=" * 70 + "\n")
 
         # 创建环境
-        env = MultiAgentEnvironment(JUNCTION_CONFIGS)
+        env = MultiAgentEnvironment(
+            junction_ids=list(JUNCTION_CONFIGS.keys()),
+            sumo_cfg='sumo/sumo.sumocfg',
+            use_gui=False,
+            seed=self.config.seed
+        )
 
         for episode in range(1, n_episodes + 1):
             logging.info(f"\n{'='*20} Episode {episode}/{n_episodes} {'='*20}")
@@ -615,6 +620,13 @@ class PPOFinetuner:
         logging.info("训练完成!")
         logging.info("=" * 70)
         logging.info(f"最佳奖励: {self.best_reward:.2f}")
+
+        # 清理环境
+        try:
+            env.close()
+            logging.info("✓ 环境已关闭")
+        except Exception as e:
+            logging.warning(f"关闭环境时出错: {e}")
 
         self.writer.close()
 
@@ -672,6 +684,7 @@ def main():
         batch_size=2048,
         n_epochs=8,
         update_frequency=2048,
+        seed=args.seed
     )
 
     # 创建微调器
