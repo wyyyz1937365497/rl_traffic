@@ -19,7 +19,7 @@ import traci
 # 添加路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import NetworkConfig
+from junction_network import NetworkConfig
 from junction_agent import JUNCTION_CONFIGS
 from junction_network import VehicleLevelMultiJunctionModel
 from road_topology_hardcoded import (
@@ -72,10 +72,8 @@ class VehicleLevelSubmissionGenerator:
         """加载训练好的车辆级模型"""
         print(f"加载模型: {self.checkpoint_path}")
 
-        # 创建车辆级模型（使用与训练时相同的配置：gnn_hidden_dim=64）
-        from config import NetworkConfig
+        # 创建车辆级模型（与PPO训练脚本保持同一NetworkConfig）
         config = NetworkConfig()
-        config.gnn_hidden_dim = 64  # 训练时使用的gnn_hidden_dim
 
         self.model = VehicleLevelMultiJunctionModel(JUNCTION_CONFIGS, config).to(self.device)
 
@@ -102,7 +100,8 @@ class VehicleLevelSubmissionGenerator:
 
         print(f"✓ 模型加载成功 (设备: {self.device})")
         print(f"  Checkpoint: {self.checkpoint_path}")
-        print(f"  GNN hidden dim: {config.gnn_hidden_dim}")
+        inferred_hidden = config.gnn_hidden_dim if hasattr(config, 'gnn_hidden_dim') else 64
+        print(f"  模型hidden_dim: {inferred_hidden}")
 
     def initialize_simulation(self):
         """初始化SUMO仿真"""

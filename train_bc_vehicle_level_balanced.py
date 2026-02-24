@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List
 import argparse
@@ -18,8 +19,7 @@ from tqdm import tqdm
 sys.path.insert(0, '.')
 
 from junction_agent import JUNCTION_CONFIGS
-from junction_network import VehicleLevelMultiJunctionModel
-from config import NetworkConfig
+from junction_network import VehicleLevelMultiJunctionModel, NetworkConfig
 
 
 class BalancedExpertDemoDataset(Dataset):
@@ -156,25 +156,37 @@ class VehicleLevelBCTrainer:
 
             vehicle_observations[junc_id] = veh_obs_dict
 
-        # 模型推理
-        all_actions, _, _ = self.model(observations, vehicle_observations, deterministic=True)
+        # 模型推理（训练时使用logits监督，保证梯度可回传）
+        all_actions, _, all_info = self.model(observations, vehicle_observations, deterministic=False)
 
         # 计算损失
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=self.device)
         num_samples = 0
 
         for junc_id, actions in all_actions.items():
             targets = action_targets[junc_id]
+            info = all_info.get(junc_id, {})
 
             for veh_type in ['main', 'ramp', 'diverge']:
-                if f'{veh_type}_actions' in actions and actions[f'{veh_type}_actions'] is not None:
-                    pred_actions = actions[f'{veh_type}_actions'][0]  # [N]
-                    target_actions = torch.tensor([t[0] for t in targets[veh_type]], dtype=torch.float32).to(self.device)
+                logits_key = f'{veh_type}_logits'
+                if logits_key in info and info[logits_key] is not None:
+                    pred_logits = info[logits_key]
+                    if pred_logits.dim() == 1:
+                        pred_logits = pred_logits.unsqueeze(0)
+                    pred_logits = pred_logits.reshape(-1, pred_logits.size(-1))
 
-                    if len(pred_actions) > 0 and len(target_actions) > 0:
-                        loss = self.mse_loss(pred_actions, target_actions)
+                    target_float = torch.tensor(
+                        [t[1] if veh_type == 'ramp' else t[0] for t in targets[veh_type]],
+                        dtype=torch.float32,
+                        device=self.device
+                    ).reshape(-1)
+                    target_idx = torch.clamp((target_float * 10.0).round().long(), 0, 10)
+
+                    valid_len = min(pred_logits.size(0), target_idx.numel())
+                    if valid_len > 0:
+                        loss = F.cross_entropy(pred_logits[:valid_len], target_idx[:valid_len])
                         total_loss += loss
-                        num_samples += 1
+                        num_samples += valid_len
 
         return total_loss, num_samples
 

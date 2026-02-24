@@ -131,6 +131,42 @@ class PPOFinetuner:
             ]
         )
 
+    def _candidate_checkpoint_keys(self, model_key: str) -> List[str]:
+        """为模型参数名生成可能的checkpoint键名（历史前缀/别名对齐）"""
+        candidates = [model_key]
+
+        # 常见前缀包装
+        candidates.append(f"network.{model_key}")
+        candidates.append(f"model.{model_key}")
+        candidates.append(f"module.{model_key}")
+        candidates.append(f"module.network.{model_key}")
+        candidates.append(f"module.model.{model_key}")
+
+        # 历史命名别名（低风险字符串替换）
+        alias_pairs = [
+            ("main_controller", "main"),
+            ("ramp_controller", "ramp"),
+            ("diverge_controller", "diverge"),
+            ("vehicle_action_head", "action_head"),
+        ]
+
+        for src, dst in alias_pairs:
+            if src in model_key:
+                alias_key = model_key.replace(src, dst)
+                candidates.append(alias_key)
+                candidates.append(f"network.{alias_key}")
+                candidates.append(f"model.{alias_key}")
+                candidates.append(f"module.{alias_key}")
+
+        # 去重并保持顺序
+        seen = set()
+        uniq = []
+        for key in candidates:
+            if key not in seen:
+                uniq.append(key)
+                seen.add(key)
+        return uniq
+
     def _load_bc_model(self, checkpoint_path: str):
         """从BC checkpoint加载模型"""
         logging.info(f"[步骤1] 加载BC模型: {checkpoint_path}")
@@ -158,22 +194,76 @@ class PPOFinetuner:
         else:
             state_dict = checkpoint
 
-        # 兼容包装器前缀（例如 network.xxx）
-        normalized_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('network.'):
-                normalized_state_dict[key[len('network.'):]] = value
-            else:
-                normalized_state_dict[key] = value
+        # 原始checkpoint键集合（保留原始前缀，后续候选键匹配）
+        checkpoint_state_dict = dict(state_dict)
 
         # 加载权重（允许部分加载）
         model_state = model.state_dict()
 
         # 调试：打印前5个key
-        logging.info(f"  Checkpoint keys (前5个): {list(normalized_state_dict.keys())[:5]}")
+        logging.info(f"  Checkpoint keys (前5个): {list(checkpoint_state_dict.keys())[:5]}")
         logging.info(f"  Model keys (前5个): {list(model_state.keys())[:5]}")
+        logging.info(f"  Checkpoint keys 总数: {len(checkpoint_state_dict)}")
 
-        pretrained_dict = {k: v for k, v in normalized_state_dict.items() if k in model_state and model_state[k].shape == v.shape}
+        # 导出完整checkpoint键名，便于排查
+        key_dump_path = os.path.join(
+            self.log_dir,
+            f"bc_keys_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        with open(key_dump_path, 'w', encoding='utf-8') as dump_file:
+            for key in sorted(checkpoint_state_dict.keys()):
+                dump_file.write(f"{key}\n")
+        logging.info(f"  [INFO] BC权重键名已导出: {key_dump_path}")
+
+        pretrained_dict = {}
+        matched_pairs = []
+        shape_mismatch = {}
+        missing_key_models = []
+        for model_key, model_tensor in model_state.items():
+            candidate_keys = self._candidate_checkpoint_keys(model_key)
+            present_keys = []
+            for ckpt_key in candidate_keys:
+                if ckpt_key in checkpoint_state_dict:
+                    present_keys.append(ckpt_key)
+                if ckpt_key in checkpoint_state_dict and checkpoint_state_dict[ckpt_key].shape == model_tensor.shape:
+                    pretrained_dict[model_key] = checkpoint_state_dict[ckpt_key]
+                    matched_pairs.append((model_key, ckpt_key))
+                    break
+            else:
+                if present_keys:
+                    first_present = present_keys[0]
+                    shape_mismatch[model_key] = (
+                        first_present,
+                        tuple(model_tensor.shape),
+                        tuple(checkpoint_state_dict[first_present].shape)
+                    )
+                else:
+                    missing_key_models.append(model_key)
+
+        # 回退策略：若checkpoint缺少部分路口参数，使用J5参数做共享初始化
+        # 适用于“单路口BC权重 -> 多路口PPO微调”场景
+        shared_init_pairs = []
+        for model_key, model_tensor in model_state.items():
+            if model_key in pretrained_dict:
+                continue
+
+            if not model_key.startswith('networks.'):
+                continue
+
+            parts = model_key.split('.')
+            if len(parts) < 3:
+                continue
+
+            target_junc = parts[1]
+            if target_junc == 'J5':
+                continue
+
+            source_key = model_key.replace(f'networks.{target_junc}.', 'networks.J5.', 1)
+            for ckpt_key in self._candidate_checkpoint_keys(source_key):
+                if ckpt_key in checkpoint_state_dict and checkpoint_state_dict[ckpt_key].shape == model_tensor.shape:
+                    pretrained_dict[model_key] = checkpoint_state_dict[ckpt_key]
+                    shared_init_pairs.append((model_key, ckpt_key))
+                    break
 
         model.load_state_dict(pretrained_dict, strict=False)
         model = model.to(device)
@@ -181,6 +271,25 @@ class PPOFinetuner:
         loaded_keys = len(pretrained_dict)
         total_keys = len(model_state)
         logging.info(f"  [OK] 加载权重: {loaded_keys}/{total_keys} 参数")
+        if shared_init_pairs:
+            logging.info(f"  [INFO] 共享初始化参数: {len(shared_init_pairs)} (J5 -> 其他路口)")
+            for model_key, ckpt_key in shared_init_pairs[:10]:
+                logging.info(f"    共享映射: {ckpt_key} -> {model_key}")
+        if loaded_keys < total_keys:
+            logging.info(f"  [INFO] 未加载参数: {total_keys - loaded_keys}")
+            for model_key, ckpt_key in matched_pairs[:10]:
+                if model_key != ckpt_key:
+                    logging.info(f"    对齐映射: {ckpt_key} -> {model_key}")
+        if shape_mismatch:
+            logging.warning(f"  [WARN] shape不匹配参数: {len(shape_mismatch)}")
+            for model_key, (ckpt_key, model_shape, ckpt_shape) in list(shape_mismatch.items())[:20]:
+                logging.warning(f"    {model_key} <= {ckpt_key} | model{model_shape} vs ckpt{ckpt_shape}")
+        if missing_key_models:
+            logging.warning(f"  [WARN] checkpoint中缺失参数键: {len(missing_key_models)}")
+            for model_key in missing_key_models[:20]:
+                logging.warning(f"    缺失: {model_key}")
+        if shape_mismatch and not missing_key_models:
+            logging.warning("  [ROOT CAUSE] 主要问题为网络结构维度不一致（非键名前缀问题）")
         logging.info(f"  设备: {device}")
 
         # 统计参数
@@ -1049,6 +1158,14 @@ class PPOFinetuner:
                 self.writer.add_scalar('Loss/policy', metrics['policy_loss'], episode)
                 self.writer.add_scalar('Loss/value', metrics['value_loss'], episode)
                 self.writer.add_scalar('Entropy', metrics['entropy'], episode)
+
+            # 熵系数衰减（低风险：仅影响探索强度）
+            self.entropy_coef = max(
+                self.config.entropy_min,
+                self.entropy_coef * self.config.entropy_decay
+            )
+            self.writer.add_scalar('Entropy/coef', self.entropy_coef, episode)
+            logging.info(f"[Episode {episode}] Entropy coef: {self.entropy_coef:.6f}")
 
             # 保存最佳模型
             if episode_data['total_reward'] > self.best_reward:
