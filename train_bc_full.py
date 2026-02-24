@@ -17,6 +17,15 @@ import logging
 from datetime import datetime
 from tqdm import tqdm
 
+# 设置控制台编码为UTF-8（Windows兼容）
+if sys.platform == 'win32':
+    if sys.stdout.encoding != 'utf-8':
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stderr.reconfigure(encoding='utf-8')
+        except:
+            pass
+
 sys.path.insert(0, '.')
 
 from junction_agent import JUNCTION_CONFIGS
@@ -341,128 +350,7 @@ def main():
         format='[%(asctime)s] [%(levelname)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
         handlers=[
-            logging.FileHandler(log_file),
+            logging.FileHandler(log_file, encoding='utf-8'),
             logging.StreamHandler()
         ]
     )
-
-    print("=" * 70)
-    print("完整BC训练脚本")
-    print("=" * 70)
-    logging.info(f"配置:")
-    logging.info(f"  数据目录: {args.train_demos}")
-    logging.info(f"  输出目录: {args.output_dir}")
-    logging.info(f"  Epochs: {args.epochs}")
-    logging.info(f"  Batch size: {args.batch_size}")
-    logging.info(f"  Control权重: {args.control_weight}")
-    logging.info(f"  设备: {args.device}")
-    logging.info(f"  随机种子: {args.seed}")
-    logging.info(f"  日志文件: {log_file}")
-
-    # 设置随机种子
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # 加载数据
-    print("\n" + "=" * 70)
-    print("步骤1: 加载数据")
-    print("=" * 70)
-    demonstrations = load_expert_demos(args.train_demos)
-
-    # 创建平衡数据集
-    dataset = BalancedExpertDemoDataset(demonstrations, control_sample_weight=args.control_weight)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-
-    # 分割训练集和验证集
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-
-    logging.info(f"[数据] 训练集: {train_size}, 验证集: {val_size}")
-
-    # 创建模型
-    print("\n" + "=" * 70)
-    print("步骤2: 创建模型")
-    print("=" * 70)
-    model = VehicleLevelBCModel(JUNCTION_CONFIGS)
-
-    # 创建训练器
-    print("\n" + "=" * 70)
-    print("步骤3: 初始化训练器")
-    print("=" * 70)
-    trainer = VehicleLevelBCTrainer(model, device=args.device, log_dir=args.log_dir)
-
-    # 训练
-    print("\n" + "=" * 70)
-    print("步骤4: 开始训练")
-    print("=" * 70)
-
-    best_val_loss = float('inf')
-    patience = 10
-    patience_counter = 0
-
-    for epoch in range(1, args.epochs + 1):
-        logging.info(f"\n{'='*20} Epoch {epoch}/{args.epochs} {'='*20}")
-
-        train_loss = trainer.train_epoch(train_loader, epoch)
-        val_loss = trainer.evaluate(val_loader, epoch)
-
-        logging.info(f"[Epoch {epoch}] 训练损失: {train_loss:.4f}, 验证损失: {val_loss:.4f}")
-
-        # 保存最佳模型
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': trainer.optimizer.state_dict(),
-                'val_loss': val_loss,
-                'train_loss': train_loss,
-            }, os.path.join(args.output_dir, 'best_model.pt'))
-            logging.info(f"✓ 保存最佳模型 (val_loss={val_loss:.4f})")
-        else:
-            patience_counter += 1
-            logging.info(f"验证损失未改善 ({patience_counter}/{patience})")
-
-            if patience_counter >= patience:
-                logging.info(f"早停: {patience}个epoch无改善")
-                break
-
-        # 每10个epoch保存checkpoint
-        if epoch % 10 == 0:
-            checkpoint_path = os.path.join(args.output_dir, f'checkpoint_epoch_{epoch}.pt')
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': trainer.optimizer.state_dict(),
-                'val_loss': val_loss,
-                'train_loss': train_loss,
-            }, checkpoint_path)
-            logging.info(f"✓ 保存checkpoint: {checkpoint_path}")
-
-    # 保存最终模型
-    torch.save({
-        'epoch': args.epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': trainer.optimizer.state_dict(),
-        'val_loss': val_loss,
-        'train_loss': train_loss,
-    }, os.path.join(args.output_dir, 'final_model.pt'))
-
-    print("\n" + "=" * 70)
-    print("训练完成!")
-    print("=" * 70)
-    logging.info(f"最佳验证损失: {best_val_loss:.4f}")
-    logging.info(f"最终模型: {os.path.join(args.output_dir, 'final_model.pt')}")
-    logging.info(f"最佳模型: {os.path.join(args.output_dir, 'best_model.pt')}")
-
-
-if __name__ == '__main__':
-    main()

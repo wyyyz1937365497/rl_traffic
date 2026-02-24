@@ -19,6 +19,16 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
+# 设置控制台编码为UTF-8（Windows兼容）
+if sys.platform == 'win32':
+    import locale
+    if sys.stdout.encoding != 'utf-8':
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stderr.reconfigure(encoding='utf-8')
+        except:
+            pass
+
 sys.path.insert(0, '.')
 
 from junction_agent import JUNCTION_CONFIGS, JunctionAgent, MultiAgentEnvironment
@@ -107,7 +117,7 @@ class PPOFinetuner:
             format='[%(asctime)s] [%(levelname)s] %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S',
             handlers=[
-                logging.FileHandler(log_file),
+                logging.FileHandler(log_file, encoding='utf-8'),
                 logging.StreamHandler()
             ]
         )
@@ -141,6 +151,11 @@ class PPOFinetuner:
 
         # 加载权重（允许部分加载）
         model_state = model.state_dict()
+
+        # 调试：打印前5个key
+        logging.info(f"  Checkpoint keys (前5个): {list(state_dict.keys())[:5]}")
+        logging.info(f"  Model keys (前5个): {list(model_state.keys())[:5]}")
+
         pretrained_dict = {k: v for k, v in state_dict.items() if k in model_state and model_state[k].shape == v.shape}
 
         model.load_state_dict(pretrained_dict, strict=False)
@@ -464,9 +479,11 @@ class PPOFinetuner:
             # 存储经验（存储原始状态向量）
             for junc_id, state_vec in state_vectors.items():
                 if junc_id in actions:
+                    # 转换为tensor
+                    state_tensor = torch.tensor(state_vec, dtype=torch.float32).to(self.device)
                     buffer.add(
-                        junc_id=junc_id,
-                        state=state_vec,
+                        junction_id=junc_id,
+                        state=state_tensor,
                         vehicle_state={},  # 简化，暂不存储车辆状态
                         action=actions[junc_id],
                         reward=reward,
