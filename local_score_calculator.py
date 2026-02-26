@@ -24,13 +24,14 @@ import json
 class LocalScoreCalculator:
     """本地分数计算器"""
 
-    def __init__(self, baseline_pkl: str = None):
+    def __init__(self, baseline_pkl: str = None, use_legacy_intervention_estimate: bool = False):
         """
         Args:
             baseline_pkl: baseline的pkl文件路径，用于计算baseline指标
         """
         self.baseline_data = None
         self.baseline_metrics = None
+        self.use_legacy_intervention_estimate = use_legacy_intervention_estimate
 
         if baseline_pkl and os.path.exists(baseline_pkl):
             print(f"加载baseline数据: {baseline_pkl}")
@@ -246,22 +247,31 @@ class LocalScoreCalculator:
                                      for action in actions.values()
                                      if action.get('lane_change', None) is not None)
         else:
-            # 估计：假设每5步控制一次，每次控制10%的CV车辆
-            control_interval = 5
-            cv_ratio = 0.1
-            controlled_vehicles_per_step = int(N * cv_ratio)
-            control_steps = T // control_interval
+            if self.use_legacy_intervention_estimate:
+                # 兼容旧版本估计：假设每5步控制一次，每次控制10%的CV车辆
+                control_interval = 5
+                cv_ratio = 0.1
+                controlled_vehicles_per_step = int(N * cv_ratio)
+                control_steps = T // control_interval
 
-            total_accel_commands = control_steps * controlled_vehicles_per_step
-            total_lane_changes = 0  # 假设不换道
+                total_accel_commands = control_steps * controlled_vehicles_per_step
+                total_lane_changes = 0  # 假设不换道
 
-            print(f"  ⚠ 未找到控制数据，使用估计值:")
-            print(f"    控制间隔: {control_interval} 步")
-            print(f"    CV比例: {cv_ratio:.1%}")
-            print(f"    估计控制步数: {control_steps}")
-            print(f"    估计每步控制车辆数: {controlled_vehicles_per_step}")
+                print(f"  ⚠ 未找到控制数据，使用旧版估计值:")
+                print(f"    控制间隔: {control_interval} 步")
+                print(f"    CV比例: {cv_ratio:.1%}")
+                print(f"    估计控制步数: {control_steps}")
+                print(f"    估计每步控制车辆数: {controlled_vehicles_per_step}")
+            else:
+                # 默认：无控制日志时不凭空估计干预成本，避免系统性高估
+                total_accel_commands = 0
+                total_lane_changes = 0
+                print(f"  ⚠ 未找到控制数据，使用中性干预惩罚(P_int=1.0)")
 
-        C_int = (self.alpha * total_accel_commands + self.beta * total_lane_changes) / (T * N)
+        if T > 0 and N > 0:
+            C_int = (self.alpha * total_accel_commands + self.beta * total_lane_changes) / (T * N)
+        else:
+            C_int = 0.0
 
         print(f"  总加速度指令数: {total_accel_commands}")
         print(f"  总换道指令数: {total_lane_changes}")
@@ -294,9 +304,12 @@ class LocalScoreCalculator:
         }
 
 
-def compare_pkl_files(pkl_files: list, baseline_pkl: str = None):
+def compare_pkl_files(pkl_files: list, baseline_pkl: str = None, use_legacy_intervention_estimate: bool = False):
     """对比多个pkl文件的得分"""
-    calculator = LocalScoreCalculator(baseline_pkl)
+    calculator = LocalScoreCalculator(
+        baseline_pkl,
+        use_legacy_intervention_estimate=use_legacy_intervention_estimate
+    )
 
     results = []
 
@@ -354,11 +367,17 @@ def main():
                         help='baseline pkl文件路径（用于计算baseline指标）')
     parser.add_argument('--output', '-o', default=None,
                         help='保存结果到JSON文件')
+    parser.add_argument('--legacy-intervention-estimate', action='store_true',
+                        help='使用旧版干预成本估计（每5步控制10%CV）')
 
     args = parser.parse_args()
 
     # 计算得分
-    results = compare_pkl_files(args.pkl_files, args.baseline)
+    results = compare_pkl_files(
+        args.pkl_files,
+        args.baseline,
+        use_legacy_intervention_estimate=args.legacy_intervention_estimate
+    )
 
     # 保存结果
     if args.output and results:

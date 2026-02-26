@@ -14,7 +14,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
-from junction_agent import JunctionType
+class JunctionType(Enum):
+    TYPE_A = "TYPE_A"
+    TYPE_B = "TYPE_B"
 
 
 @dataclass

@@ -1,0 +1,31 @@
+[
+  {
+    "S_total": 0.0,
+    "S_efficiency": 0.0,
+    "Delta_OCR": -0.0226946509525809,
+    "OCR_AI": 0.5666242013035329,
+    "OCR_Base": 0.5797821549383949,
+    "prelim_assumption": {
+      "W_stability": 0,
+      "P_int": 1,
+      "final_formula": "S_total = S_efficiency"
+    },
+    "detail": {
+      "ai": {
+        "ocr": 0.5666242013035329,
+        "n_total": 9900,
+        "n_arrived": 5448,
+        "enroute_completion_sum": 161.57959290497573,
+        "n_observed_vehicles": 5798
+      },
+      "baseline": {
+        "ocr": 0.5797821549383949,
+        "n_total": 9900,
+        "n_arrived": 5593,
+        "enroute_completion_sum": 146.84333389010925,
+        "n_observed_vehicles": 5919
+      }
+    },
+    "ai_pkl": "submit_hybrid_latest.pkl"
+  }
+]

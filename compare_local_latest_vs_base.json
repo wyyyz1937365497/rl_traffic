@@ -1,0 +1,30 @@
+[
+  {
+    "pkl_file": "submit_hybrid_latest.pkl",
+    "total_score": 0.0,
+    "efficiency_score": 0,
+    "stability_score": 0.0,
+    "intervention_penalty": 1.0,
+    "intervention_cost": 0.0,
+    "ocr": 0.9396,
+    "speed_std": 6.1939,
+    "mean_abs_accel": 0.3119,
+    "ocr_improvement": -0.0056,
+    "I_speed_std": -0.0118,
+    "I_mean_accel": -0.013
+  },
+  {
+    "pkl_file": "baseline_no_control.pkl",
+    "total_score": 0.0,
+    "efficiency_score": 0,
+    "stability_score": 0.0,
+    "intervention_penalty": 1.0,
+    "intervention_cost": 0.0,
+    "ocr": 0.9449,
+    "speed_std": 6.1213,
+    "mean_abs_accel": 0.3079,
+    "ocr_improvement": 0.0,
+    "I_speed_std": -0.0,
+    "I_mean_accel": -0.0
+  }
+]

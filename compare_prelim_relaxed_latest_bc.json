@@ -1,0 +1,89 @@
+[
+  {
+    "S_total": 1.3789528514064586,
+    "S_efficiency": 1.3789528514064586,
+    "Delta_OCR": 0.013789528514064587,
+    "OCR_AI": 0.5877770774958637,
+    "OCR_Base": 0.5797821549383949,
+    "prelim_assumption": {
+      "W_stability": 0,
+      "P_int": 1,
+      "final_formula": "S_total = S_efficiency"
+    },
+    "detail": {
+      "ai": {
+        "ocr": 0.5877770774958637,
+        "n_total": 9900,
+        "n_arrived": 5683,
+        "enroute_completion_sum": 135.9930672090506,
+        "n_observed_vehicles": 5985
+      },
+      "baseline": {
+        "ocr": 0.5797821549383949,
+        "n_total": 9900,
+        "n_arrived": 5593,
+        "enroute_completion_sum": 146.84333389010925,
+        "n_observed_vehicles": 5919
+      }
+    },
+    "ai_pkl": "submit_hybrid_relaxed_gate.pkl"
+  },
+  {
+    "S_total": 0.0,
+    "S_efficiency": 0.0,
+    "Delta_OCR": -0.0226946509525809,
+    "OCR_AI": 0.5666242013035329,
+    "OCR_Base": 0.5797821549383949,
+    "prelim_assumption": {
+      "W_stability": 0,
+      "P_int": 1,
+      "final_formula": "S_total = S_efficiency"
+    },
+    "detail": {
+      "ai": {
+        "ocr": 0.5666242013035329,
+        "n_total": 9900,
+        "n_arrived": 5448,
+        "enroute_completion_sum": 161.57959290497573,
+        "n_observed_vehicles": 5798
+      },
+      "baseline": {
+        "ocr": 0.5797821549383949,
+        "n_total": 9900,
+        "n_arrived": 5593,
+        "enroute_completion_sum": 146.84333389010925,
+        "n_observed_vehicles": 5919
+      }
+    },
+    "ai_pkl": "submit_hybrid_latest.pkl"
+  },
+  {
+    "S_total": 0.0,
+    "S_efficiency": 0.0,
+    "Delta_OCR": -0.012693027087676686,
+    "OCR_AI": 0.5724229643408103,
+    "OCR_Base": 0.5797821549383949,
+    "prelim_assumption": {
+      "W_stability": 0,
+      "P_int": 1,
+      "final_formula": "S_total = S_efficiency"
+    },
+    "detail": {
+      "ai": {
+        "ocr": 0.5724229643408103,
+        "n_total": 9900,
+        "n_arrived": 5530,
+        "enroute_completion_sum": 136.98734697402267,
+        "n_observed_vehicles": 5837
+      },
+      "baseline": {
+        "ocr": 0.5797821549383949,
+        "n_total": 9900,
+        "n_arrived": 5593,
+        "enroute_completion_sum": 146.84333389010925,
+        "n_observed_vehicles": 5919
+      }
+    },
+    "ai_pkl": "submit_bc_v4_fixed_state.pkl"
+  }
+]

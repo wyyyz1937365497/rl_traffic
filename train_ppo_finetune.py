@@ -53,7 +53,10 @@ class PPOFinetuner:
         bc_checkpoint_path: str,
         config: PPOConfig = None,
         device: str = 'cuda',
-        log_dir: str = './logs/ppo_finetune'
+        log_dir: str = './logs/ppo_finetune',
+        anchor_coef: float = 1e-5,
+        anchor_decay: float = 0.999,
+        early_stop_patience: int = 0
     ):
         """
         初始化PPO微调器
@@ -101,6 +104,25 @@ class PPOFinetuner:
         self.cumulative_departed = 0
         self.cumulative_arrived = 0
         self.value_clip_epsilon = 0.2
+        self.anchor_coef = float(anchor_coef)
+        self.anchor_decay = float(anchor_decay)
+        self.anchor_min = 0.0
+        self.early_stop_patience = int(early_stop_patience)
+        self.no_improve_count = 0
+        self.bc_anchor_params = {
+            name: param.detach().clone()
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        }
+
+        logging.info(f"[防漂移] Anchor coef: {self.anchor_coef}")
+        logging.info(f"[防漂移] Anchor decay: {self.anchor_decay}")
+        logging.info(f"[早停] Patience: {self.early_stop_patience}")
+
+        self.min_speed_ratio = 0.88
+        self.release_speed_ratio = 0.78
+        self.near_merge_threshold = 0.45
+        self.prev_ocr = 0.0
 
         logging.info("=" * 70)
         logging.info("初始化完成\n")
@@ -324,112 +346,8 @@ class PPOFinetuner:
         Returns:
             reward: 标量奖励值
         """
-        speeds = step_info.get('speeds', [])
-        accelerations = step_info.get('accelerations', [])
-
-        num_departed = step_info.get('num_departed', 0)
-        num_arrived = step_info.get('num_arrived', 0)
-        num_active = step_info.get('num_active', 0)
-        num_collisions = step_info.get('num_collisions', 0)
-        num_emergency_stops = step_info.get('num_emergency_stops', 0)
-
-        if not speeds:
-            return 0.0
-
-        speed_limit = 13.89
-
-        # =====================================================================
-        # 1. 流量奖励（权重4.5）- 最重要
-        # =====================================================================
-        # 1.1 平均速度奖励（直接反映流量效率）
-        mean_speed = np.mean(speeds)
-        # 使用平方放大高速度的奖励
-        speed_reward = 3.0 * (mean_speed / speed_limit) ** 2
-
-        # 1.2 活跃车辆奖励（系统容量利用）
-        # 鼓励系统内有更多车辆同时运行
-        traffic_reward = 1.5 * (num_active / 500.0)  # 500是理论最大容量
-
-        # 流量总奖励
-        throughput_reward = speed_reward + traffic_reward
-
-        # =====================================================================
-        # 2. 稳定性奖励（权重3.0）- 第二重要
-        # =====================================================================
-        # 2.1 速度稳定性（标准差越小越好）
-        if len(speeds) > 1:
-            speed_std = np.std(speeds)
-            # 目标：标准差 < 6 m/s（比baseline 8.0更严格）
-            stability_speed_reward = 1.5 * max(0, 1.0 - speed_std / 6.0)
-        else:
-            stability_speed_reward = 0.0
-
-        # 2.2 加速度稳定性（减少急加减速）
-        if accelerations and len(accelerations) > 0:
-            mean_abs_accel = np.mean(np.abs(accelerations))
-            # 目标：平均绝对加速度 < 1.0 m/s²（比baseline 1.2更严格）
-            stability_accel_reward = 1.5 * max(0, 1.0 - mean_abs_accel / 1.0)
-        else:
-            stability_accel_reward = 0.0
-
-        stability_reward = stability_speed_reward + stability_accel_reward
-
-        # =====================================================================
-        # 3. OCR奖励（权重2.0）- 目标0.96-0.97
-        # =====================================================================
-        if num_departed > 0:
-            current_ocr = num_arrived / num_departed
-            # 目标OCR 0.96-0.97，使用sigmoid函数奖励接近目标的值
-            # 低于0.93（BC基线）给予较小奖励
-            # 高于0.93给予指数增长奖励
-            if current_ocr >= 0.93:
-                # 超过基线，给予额外奖励，目标0.965
-                ocr_reward = 2.0 * ((current_ocr - 0.93) / (0.965 - 0.93)) ** 2
-                ocr_reward = min(ocr_reward, 3.0)  # 上限3.0
-            else:
-                # 低于基线，线性惩罚
-                ocr_reward = 2.0 * (current_ocr / 0.93)
-        else:
-            ocr_reward = 0.0
-
-        # =====================================================================
-        # 4. 安全性惩罚（权重-2.5）- 更严格
-        # =====================================================================
-        safety_penalty = 0.0
-
-        # 4.1 碰撞惩罚（每次碰撞扣分增加）
-        collision_penalty = -1.0 * num_collisions
-
-        # 4.2 急停惩罚
-        emergency_stop_penalty = -0.2 * num_emergency_stops
-
-        # 4.3 慢速车辆惩罚（速度<3 m/s的车辆比例）
-        if speeds:
-            slow_ratio = sum(1 for s in speeds if s < 3.0) / len(speeds)
-            slow_penalty = -1.5 * slow_ratio  # 加大惩罚权重
-        else:
-            slow_penalty = 0.0
-
-        # 4.4 拥堵惩罚（速度<5 m/s的车辆比例）
-        if speeds:
-            jam_ratio = sum(1 for s in speeds if s < 5.0) / len(speeds)
-            jam_penalty = -0.5 * jam_ratio
-        else:
-            jam_penalty = 0.0
-
-        safety_penalty = collision_penalty + emergency_stop_penalty + slow_penalty + jam_penalty
-
-        # =====================================================================
-        # 总奖励
-        # =====================================================================
-        total_reward = (
-            throughput_reward +      # 流量奖励（权重4.5）
-            stability_reward +        # 稳定性奖励（权重3.0）
-            ocr_reward +              # OCR奖励（权重2.0）
-            safety_penalty            # 安全性惩罚（权重-2.5）
-        )
-
-        return total_reward
+        reward, _ = self.compute_reward_with_breakdown(step_info)
+        return reward
 
     def compute_reward_with_breakdown(self, step_info: Dict) -> Tuple[float, Dict]:
         """
@@ -447,51 +365,63 @@ class PPOFinetuner:
         num_active = step_info.get('num_active', 0)
         num_collisions = step_info.get('num_collisions', 0)
         num_emergency_stops = step_info.get('num_emergency_stops', 0)
+        step_departed = step_info.get('step_departed', 0)
+        step_arrived = step_info.get('step_arrived', 0)
 
         speed_limit = 13.89
 
-        # 1. 流量奖励（权重4.5）
+        # 1. 流量奖励（强化吞吐）
         mean_speed = np.mean(speeds) if speeds else 0.0
-        speed_reward = 3.0 * (mean_speed / speed_limit) ** 2
-        traffic_reward = 1.5 * (num_active / 500.0) if num_active > 0 else 0.0
-        throughput_reward = speed_reward + traffic_reward
+        speed_reward = 2.2 * (mean_speed / speed_limit)
+        traffic_reward = 0.8 * min(1.0, num_active / 350.0) if num_active > 0 else 0.0
+        arrival_reward = 1.8 * min(1.0, step_arrived / 3.0)
+        throughput_reward = speed_reward + traffic_reward + arrival_reward
 
-        # 2. 稳定性奖励（权重3.0）
+        # 2. 稳定性奖励
         stability_speed_reward = 0.0
         if len(speeds) > 1:
             speed_std = np.std(speeds)
-            stability_speed_reward = 1.5 * max(0, 1.0 - speed_std / 6.0)
+            stability_speed_reward = 1.2 * max(0, 1.0 - speed_std / 6.0)
 
         stability_accel_reward = 0.0
         if accelerations and len(accelerations) > 0:
             mean_abs_accel = np.mean(np.abs(accelerations))
-            stability_accel_reward = 1.5 * max(0, 1.0 - mean_abs_accel / 1.0)
+            stability_accel_reward = 1.0 * max(0, 1.0 - mean_abs_accel / 1.0)
 
         stability_reward = stability_speed_reward + stability_accel_reward
 
-        # 3. OCR奖励（权重2.0）- 目标0.96-0.97
+        # 3. OCR奖励（同时优化OCR水平与OCR增量）
         ocr_reward = 0.0
+        current_ocr = 0.0
+        ocr_delta = 0.0
         if num_departed > 0:
             current_ocr = num_arrived / num_departed
-            if current_ocr >= 0.93:
-                ocr_reward_calc = 2.0 * ((current_ocr - 0.93) / (0.965 - 0.93)) ** 2
-                ocr_reward = min(ocr_reward_calc, 3.0)
-            else:
-                ocr_reward = 2.0 * (current_ocr / 0.93)
+            prev_ocr = float(getattr(self, 'prev_ocr', current_ocr))
+            ocr_delta = current_ocr - prev_ocr
 
-        # 4. 安全性惩罚（权重-2.5）
+            ocr_level_reward = 2.0 * max(0.0, (current_ocr - 0.93) / (0.97 - 0.93))
+            ocr_level_reward = min(ocr_level_reward, 2.5)
+            ocr_delta_reward = float(np.clip(6.0 * ocr_delta, -1.5, 1.5))
+            ocr_reward = ocr_level_reward + ocr_delta_reward
+
+        backlog_penalty = 0.0
+        if num_departed > 0:
+            backlog_ratio = max(0.0, (num_departed - num_arrived) / num_departed)
+            backlog_penalty = -0.8 * backlog_ratio
+
+        # 4. 安全性惩罚
         collision_penalty = -1.0 * num_collisions
         emergency_stop_penalty = -0.2 * num_emergency_stops
 
         slow_penalty = 0.0
         if speeds:
             slow_ratio = sum(1 for s in speeds if s < 3.0) / len(speeds)
-            slow_penalty = -1.5 * slow_ratio
+            slow_penalty = -2.0 * slow_ratio
 
         jam_penalty = 0.0
         if speeds:
             jam_ratio = sum(1 for s in speeds if s < 5.0) / len(speeds)
-            jam_penalty = -0.5 * jam_ratio
+            jam_penalty = -0.8 * jam_ratio
 
         safety_penalty = collision_penalty + emergency_stop_penalty + slow_penalty + jam_penalty
 
@@ -500,17 +430,23 @@ class PPOFinetuner:
             'throughput_reward': throughput_reward,  # 流量（最重要）
             'speed_reward': speed_reward,
             'traffic_reward': traffic_reward,
+            'arrival_reward': arrival_reward,
             'stability_reward': stability_reward,
             'stability_speed': stability_speed_reward,
             'stability_accel': stability_accel_reward,
             'ocr_reward': ocr_reward,
+            'ocr_delta': ocr_delta,
+            'current_ocr': current_ocr,
+            'backlog_penalty': backlog_penalty,
             'safety_penalty': safety_penalty,
             'collision_penalty': collision_penalty,
             'emergency_stop_penalty': emergency_stop_penalty,
             'slow_penalty': slow_penalty,
             'jam_penalty': jam_penalty,
-            'total': throughput_reward + stability_reward + ocr_reward + safety_penalty
+            'total': throughput_reward + stability_reward + ocr_reward + backlog_penalty + safety_penalty
         }
+
+        self.prev_ocr = current_ocr
 
         return breakdown['total'], breakdown
 
@@ -596,6 +532,8 @@ class PPOFinetuner:
             'accelerations': accelerations,
             'num_departed': num_departed,
             'num_arrived': num_arrived,
+            'step_departed': step_departed,
+            'step_arrived': step_arrived,
             'num_active': len(vehicle_ids),
             'num_collisions': num_collisions,
             'num_emergency_stops': num_emergency_stops,
@@ -675,6 +613,7 @@ class PPOFinetuner:
         state_vectors = env.reset()  # Dict[junc_id, np.ndarray]
         self.cumulative_departed = 0
         self.cumulative_arrived = 0
+        self.prev_ocr = 0.0
 
         for step in tqdm(range(max_steps), desc="收集episode"):
             # 构建模型输入（包含车辆观测）
@@ -693,6 +632,17 @@ class PPOFinetuner:
 
             # 计算奖励（带分解）
             step_info = self._build_step_info(info)
+            control_values = []
+            for junc_actions in env_actions.values():
+                control_values.extend(list(junc_actions.values()))
+            if control_values:
+                control_array = np.array(control_values, dtype=np.float32)
+                step_info['num_controlled'] = int(control_array.size)
+                step_info['control_effort'] = float(np.mean(np.abs(control_array - 1.0)))
+            else:
+                step_info['num_controlled'] = 0
+                step_info['control_effort'] = 0.0
+
             reward, breakdown = self.compute_reward_with_breakdown(step_info)
             episode_reward += reward
             episode_rewards.append(reward)
@@ -783,6 +733,38 @@ class PPOFinetuner:
         log_probs = {}
         values = {}
 
+        def _risk_score(feat: np.ndarray, veh_type: str) -> int:
+            if feat is None or len(feat) < 7:
+                return 0
+            speed_norm = float(feat[0])
+            waiting_norm = float(feat[3])
+            dist_to_end_norm = float(feat[6])
+            score = 0
+            if dist_to_end_norm <= self.near_merge_threshold:
+                score += 1
+            if speed_norm <= 0.45:
+                score += 1
+            if waiting_norm >= 0.25:
+                score += 1
+            if veh_type in ('ramp', 'diverge'):
+                if speed_norm <= 0.50:
+                    score += 1
+            else:
+                if speed_norm <= 0.40:
+                    score += 1
+            return score
+
+        def _is_high_conflict_risk(feat: np.ndarray, veh_type: str) -> bool:
+            threshold = 3 if veh_type in ('ramp', 'diverge') else 4
+            return _risk_score(feat, veh_type) >= threshold
+
+        def _should_release(feat: np.ndarray) -> bool:
+            if feat is None or len(feat) < 7:
+                return True
+            speed_norm = float(feat[0])
+            dist_to_end_norm = float(feat[6])
+            return (speed_norm >= self.release_speed_ratio and dist_to_end_norm > 0.6) or dist_to_end_norm > 1.0
+
         # 模型推理
         with torch.no_grad():
             all_actions, all_values, all_info = self.model(
@@ -800,6 +782,7 @@ class PPOFinetuner:
                 action_key = f'{veh_type}_actions'
                 veh_ids = controlled.get(veh_type, [])
                 veh_actions = output.get(action_key)
+                veh_feats = vehicle_observations.get(junc_id, {}).get(veh_type)
 
                 if veh_actions is None:
                     continue
@@ -807,9 +790,22 @@ class PPOFinetuner:
                 if veh_actions.dim() > 1:
                     veh_actions = veh_actions.squeeze(0)
 
+                if torch.is_tensor(veh_feats):
+                    if veh_feats.dim() == 3:
+                        veh_feats = veh_feats.squeeze(0)
+                    veh_feats_np = veh_feats.detach().cpu().numpy()
+                else:
+                    veh_feats_np = None
+
                 n = min(len(veh_ids), veh_actions.shape[0])
                 for i in range(n):
-                    junc_env_actions[veh_ids[i]] = float(torch.clamp(veh_actions[i], 0.0, 1.0).item())
+                    feat = veh_feats_np[i] if veh_feats_np is not None and i < len(veh_feats_np) else None
+                    if _should_release(feat) or (not _is_high_conflict_risk(feat, veh_type)):
+                        continue
+
+                    action_val = float(torch.clamp(veh_actions[i], 0.0, 1.0).item())
+                    action_val = max(action_val, self.min_speed_ratio)
+                    junc_env_actions[veh_ids[i]] = action_val
 
             env_actions[junc_id] = junc_env_actions
             policy_actions[junc_id] = {
@@ -995,6 +991,7 @@ class PPOFinetuner:
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
+        total_anchor_loss = 0.0
         num_updates = 0
 
         # 多个epoch更新
@@ -1046,8 +1043,24 @@ class PPOFinetuner:
                 value_loss_clipped = nn.functional.smooth_l1_loss(values_clipped, returns_batch, reduction='none')
                 value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
                 entropy = entropies.mean()
+                if self.anchor_coef > 0.0:
+                    anchor_loss = torch.tensor(0.0, device=self.device)
+                    for name, param in self.model.named_parameters():
+                        if not param.requires_grad:
+                            continue
+                        anchor_param = self.bc_anchor_params.get(name)
+                        if anchor_param is None:
+                            continue
+                        anchor_loss = anchor_loss + nn.functional.mse_loss(param, anchor_param, reduction='mean')
+                else:
+                    anchor_loss = torch.tensor(0.0, device=self.device)
 
-                loss = policy_loss + self.config.value_coef * value_loss - self.entropy_coef * entropy
+                loss = (
+                    policy_loss
+                    + self.config.value_coef * value_loss
+                    - self.entropy_coef * entropy
+                    + self.anchor_coef * anchor_loss
+                )
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -1057,12 +1070,14 @@ class PPOFinetuner:
                 total_policy_loss += float(policy_loss.item())
                 total_value_loss += float(value_loss.item())
                 total_entropy += float(entropy.item())
+                total_anchor_loss += float(anchor_loss.item())
                 num_updates += 1
 
         metrics = {
             'policy_loss': total_policy_loss / max(num_updates, 1),
             'value_loss': total_value_loss / max(num_updates, 1),
             'entropy': total_entropy / max(num_updates, 1),
+            'anchor_loss': total_anchor_loss / max(num_updates, 1),
         }
 
         return metrics
@@ -1151,12 +1166,14 @@ class PPOFinetuner:
                 logging.info(f"[Episode {episode}] Policy loss: {metrics['policy_loss']:.4f}")
                 logging.info(f"[Episode {episode}] Value loss: {metrics['value_loss']:.4f}")
                 logging.info(f"[Episode {episode}] Entropy: {metrics['entropy']:.4f}")
+                logging.info(f"[Episode {episode}] Anchor loss: {metrics['anchor_loss']:.6f}")
 
                 # TensorBoard记录
                 self.writer.add_scalar('Reward/total', episode_data['total_reward'], episode)
                 self.writer.add_scalar('Reward/mean', episode_data['mean_reward'], episode)
                 self.writer.add_scalar('Loss/policy', metrics['policy_loss'], episode)
                 self.writer.add_scalar('Loss/value', metrics['value_loss'], episode)
+                self.writer.add_scalar('Loss/anchor', metrics['anchor_loss'], episode)
                 self.writer.add_scalar('Entropy', metrics['entropy'], episode)
 
             # 熵系数衰减（低风险：仅影响探索强度）
@@ -1164,18 +1181,28 @@ class PPOFinetuner:
                 self.config.entropy_min,
                 self.entropy_coef * self.config.entropy_decay
             )
+            self.anchor_coef = max(self.anchor_min, self.anchor_coef * self.anchor_decay)
             self.writer.add_scalar('Entropy/coef', self.entropy_coef, episode)
+            self.writer.add_scalar('Anchor/coef', self.anchor_coef, episode)
             logging.info(f"[Episode {episode}] Entropy coef: {self.entropy_coef:.6f}")
+            logging.info(f"[Episode {episode}] Anchor coef: {self.anchor_coef:.8f}")
 
             # 保存最佳模型
             if episode_data['total_reward'] > self.best_reward:
                 self.best_reward = episode_data['total_reward']
+                self.no_improve_count = 0
                 self._save_checkpoint(episode, episode_data['total_reward'], 'best_model.pt')
                 logging.info(f"✓ 保存最佳模型 (reward={episode_data['total_reward']:.2f})")
+            else:
+                self.no_improve_count += 1
 
             # 定期保存
             if episode % 10 == 0:
                 self._save_checkpoint(episode, episode_data['total_reward'], f'checkpoint_ep{episode}.pt')
+
+            if self.early_stop_patience > 0 and self.no_improve_count >= self.early_stop_patience:
+                logging.info(f"[早停] 连续{self.no_improve_count}个episode无提升，提前停止训练")
+                break
 
         logging.info("\n" + "=" * 70)
         logging.info("训练完成!")
@@ -1225,6 +1252,12 @@ def main():
                         help='设备')
     parser.add_argument('--seed', type=int, default=42,
                         help='随机种子')
+    parser.add_argument('--anchor-coef', type=float, default=1e-5,
+                        help='BC参数锚定正则系数')
+    parser.add_argument('--anchor-decay', type=float, default=0.999,
+                        help='BC参数锚定正则衰减')
+    parser.add_argument('--early-stop-patience', type=int, default=20,
+                        help='连续无提升的早停耐心值，<=0表示关闭')
 
     args = parser.parse_args()
 
@@ -1252,7 +1285,10 @@ def main():
         bc_checkpoint_path=args.bc_checkpoint,
         config=config,
         device=args.device,
-        log_dir=args.log_dir
+        log_dir=args.log_dir,
+        anchor_coef=args.anchor_coef,
+        anchor_decay=args.anchor_decay,
+        early_stop_patience=args.early_stop_patience,
     )
 
     # 开始训练

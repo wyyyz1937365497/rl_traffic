@@ -25,9 +25,7 @@ except ImportError:
 # 添加路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from junction_agent import JUNCTION_CONFIGS
-from junction_network import VehicleLevelMultiJunctionModel
-from config import NetworkConfig
+from junction_network import VehicleLevelMultiJunctionModel, NetworkConfig
 
 
 # ============================================================================
@@ -246,6 +244,11 @@ class BCSubmissionGenerator:
         # BC模型
         self.model = None
 
+        # 控制门控参数（优先保吞吐，避免过度控速）
+        self.min_speed_ratio = 0.88
+        self.release_speed_ratio = 0.78
+        self.near_merge_threshold = 0.45  # 仅在更靠近汇入区时触发风险控制
+
     def generate_pkl(self, output_path: str, max_steps: int = 3600, seed: int = 42) -> str:
         """生成PKL文件"""
         print("=" * 70)
@@ -300,9 +303,9 @@ class BCSubmissionGenerator:
         """加载BC模型"""
         print(f"\n加载BC模型: {self.checkpoint_path}")
 
-        # 创建模型（使用默认配置，与训练时保持一致）
+        # 创建模型（与PPO/BC训练使用同一NetworkConfig）
         config = NetworkConfig()
-        self.model = VehicleLevelMultiJunctionModel(JUNCTION_CONFIGS, config).to(self.device)
+        self.model = VehicleLevelMultiJunctionModel(TRAINING_JUNCTION_CONFIGS, config).to(self.device)
 
         # 加载权重
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
@@ -312,17 +315,36 @@ class BCSubmissionGenerator:
         else:
             model_state = checkpoint
 
-        # 去除 'network.' 前缀
-        new_model_state = {}
-        for key, value in model_state.items():
-            if key.startswith('network.'):
-                new_key = key[8:]
-                new_model_state[new_key] = value
-            else:
-                new_model_state[key] = value
+        # 候选键名匹配（兼容 network./module. 等前缀）
+        def candidate_keys(model_key: str):
+            candidates = [
+                model_key,
+                f"network.{model_key}",
+                f"model.{model_key}",
+                f"module.{model_key}",
+                f"module.network.{model_key}",
+                f"module.model.{model_key}",
+            ]
+            seen = set()
+            uniq = []
+            for key in candidates:
+                if key not in seen:
+                    uniq.append(key)
+                    seen.add(key)
+            return uniq
 
-        self.model.load_state_dict(new_model_state)
+        model_state_ref = self.model.state_dict()
+        loadable_state = {}
+        for model_key, model_tensor in model_state_ref.items():
+            for ckpt_key in candidate_keys(model_key):
+                if ckpt_key in model_state and model_state[ckpt_key].shape == model_tensor.shape:
+                    loadable_state[model_key] = model_state[ckpt_key]
+                    break
+
+        self.model.load_state_dict(loadable_state, strict=False)
         self.model.eval()
+
+        print(f"  加载权重: {len(loadable_state)}/{len(model_state_ref)}")
 
         print(f"✓ BC模型加载成功 (设备: {self.device})")
 
@@ -527,6 +549,44 @@ class BCSubmissionGenerator:
 
         return controlled, vehicle_features
 
+    def _risk_score(self, feat: np.ndarray, veh_type: str) -> int:
+        """基于车辆特征计算冲突风险分数"""
+        if feat is None or len(feat) < 7:
+            return 0
+
+        speed_norm = float(feat[0])
+        waiting_norm = float(feat[3])
+        dist_to_end_norm = float(feat[6])
+
+        score = 0
+        if dist_to_end_norm <= self.near_merge_threshold:
+            score += 1
+        if speed_norm <= 0.45:
+            score += 1
+        if waiting_norm >= 0.25:
+            score += 1
+
+        if veh_type in ('ramp', 'diverge'):
+            if speed_norm <= 0.50:
+                score += 1
+        else:
+            if speed_norm <= 0.40:
+                score += 1
+
+        return score
+
+    def _is_high_conflict_risk(self, feat: np.ndarray, veh_type: str) -> bool:
+        score = self._risk_score(feat, veh_type)
+        threshold = 3 if veh_type in ('ramp', 'diverge') else 4
+        return score >= threshold
+
+    def _should_release_control(self, feat: np.ndarray) -> bool:
+        if feat is None or len(feat) < 7:
+            return True
+        speed_norm = float(feat[0])
+        dist_to_end_norm = float(feat[6])
+        return (speed_norm >= self.release_speed_ratio and dist_to_end_norm > 0.6) or dist_to_end_norm > 1.0
+
     def _run_simulation(self, max_steps: int):
         """运行仿真"""
         print(f"\n开始仿真...")
@@ -565,6 +625,7 @@ class BCSubmissionGenerator:
         junction_observations = {}
         junction_vehicle_obs = {}
         junction_controlled = {}
+        junction_vehicle_features = {}
 
         # 维护边速度缓存
         edge_speeds = {}
@@ -623,6 +684,7 @@ class BCSubmissionGenerator:
             junction_observations[junc_id] = state_tensor
             junction_vehicle_obs[junc_id] = veh_obs_dict
             junction_controlled[junc_id] = controlled
+            junction_vehicle_features[junc_id] = vehicle_features
 
         # 如果没有CV车辆，跳过
         if not junction_observations:
@@ -655,7 +717,7 @@ class BCSubmissionGenerator:
             if step % 300 == 0:
                 for junc_id, actions in list(all_actions.items())[:1]:  # 只打印第一个路口
                     if 'main_actions' in actions and actions['main_actions'] is not None:
-                        main_acts = actions['main_actions'][0]
+                        main_acts = actions['main_actions'].reshape(-1)
                         print(f"    {junc_id} main_actions: min={main_acts.min().item():.3f}, max={main_acts.max().item():.3f}, mean={main_acts.mean().item():.3f}")
 
         except Exception as e:
@@ -665,46 +727,66 @@ class BCSubmissionGenerator:
 
         # 应用速度控制
         total_speed_set = 0
+        total_release = 0
         for junc_id, actions in all_actions.items():
             controlled = junction_controlled[junc_id]
+            vehicle_features = junction_vehicle_features.get(junc_id, {})
 
             # 应用主路动作
             if 'main_actions' in actions and actions['main_actions'] is not None:
-                main_actions = actions['main_actions'][0]
+                main_actions = actions['main_actions'].reshape(-1)
                 for i, veh_id in enumerate(controlled['main']):
-                    if i < len(main_actions):
+                    if i < main_actions.numel():
+                        feat = vehicle_features.get(veh_id)
+                        if self._should_release_control(feat) or (not self._is_high_conflict_risk(feat, 'main')):
+                            traci.vehicle.setSpeed(veh_id, -1.0)
+                            total_release += 1
+                            continue
+
                         action_val = main_actions[i].item()
-                        # 避免过度减速：设置下限为0.6
-                        action_val = max(action_val, 0.6)
+                        # 避免过度减速：提高下限
+                        action_val = max(action_val, self.min_speed_ratio)
                         target_speed = SPEED_LIMIT * action_val
                         traci.vehicle.setSpeed(veh_id, target_speed)
                         total_speed_set += 1
 
             # 应用匝道动作
             if 'ramp_actions' in actions and actions['ramp_actions'] is not None:
-                ramp_actions = actions['ramp_actions'][0]
+                ramp_actions = actions['ramp_actions'].reshape(-1)
                 for i, veh_id in enumerate(controlled['ramp']):
-                    if i < len(ramp_actions):
+                    if i < ramp_actions.numel():
+                        feat = vehicle_features.get(veh_id)
+                        if self._should_release_control(feat) or (not self._is_high_conflict_risk(feat, 'ramp')):
+                            traci.vehicle.setSpeed(veh_id, -1.0)
+                            total_release += 1
+                            continue
+
                         action_val = ramp_actions[i].item()
-                        # 匝道也需要下限
-                        action_val = max(action_val, 0.6)
+                        # 匝道也提高下限
+                        action_val = max(action_val, self.min_speed_ratio)
                         target_speed = SPEED_LIMIT * action_val
                         traci.vehicle.setSpeed(veh_id, target_speed)
                         total_speed_set += 1
 
             # 应用分流动作
             if 'diverge_actions' in actions and actions['diverge_actions'] is not None:
-                diverge_actions = actions['diverge_actions'][0]
+                diverge_actions = actions['diverge_actions'].reshape(-1)
                 for i, veh_id in enumerate(controlled['diverge']):
-                    if i < len(diverge_actions):
+                    if i < diverge_actions.numel():
+                        feat = vehicle_features.get(veh_id)
+                        if self._should_release_control(feat) or (not self._is_high_conflict_risk(feat, 'diverge')):
+                            traci.vehicle.setSpeed(veh_id, -1.0)
+                            total_release += 1
+                            continue
+
                         action_val = diverge_actions[i].item()
-                        action_val = max(action_val, 0.6)
+                        action_val = max(action_val, self.min_speed_ratio)
                         target_speed = SPEED_LIMIT * action_val
                         traci.vehicle.setSpeed(veh_id, target_speed)
                         total_speed_set += 1
 
         if step % 300 == 0:
-            print(f"  [BC控制] 本步设置了{total_speed_set}辆车的速度")
+            print(f"  [BC控制] 本步控速={total_speed_set}，放行释放={total_release}")
 
     def _collect_step_data(self, step: int, current_time: float):
         """收集时间步数据（完全匹配generate_submission.py格式）"""

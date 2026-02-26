@@ -1,0 +1,264 @@
+{
+  "ai_file": "submit_hybrid_relaxed_gate.pkl",
+  "ai_report": {
+    "summary": {
+      "total_steps": 3600,
+      "departed": 5985,
+      "arrived": 5683,
+      "arrive_ratio_simple": 0.9495405179615706,
+      "ocr_doc_formula": 0.5877770774958637,
+      "total_vehicles_for_ocr": 9900,
+      "observed_unique_vehicles": 5985
+    },
+    "flow": {
+      "active_mean": 305.7263888888889,
+      "active_max": 388,
+      "active_p95": 355.0499999999997,
+      "final_arrived": 5683
+    },
+    "speed": {
+      "mean": 7.74644303744001,
+      "std": 6.115952064327196,
+      "p10": 0.0,
+      "p50": 11.179863541276603,
+      "p90": 14.188635000000001,
+      "low_speed_ratio_lt3": 0.36451801947093215,
+      "jam_speed_ratio_lt5": 0.39284218368821067
+    },
+    "accel": {
+      "mean_abs": 0.3738690974196604,
+      "std": 1.0598332687451841,
+      "p90_abs": 2.0999999999999996
+    },
+    "top_edges": [
+      [
+        "-E8",
+        167104
+      ],
+      [
+        "E17",
+        107605
+      ],
+      [
+        "E23",
+        102363
+      ],
+      [
+        "E15",
+        84669
+      ],
+      [
+        "-E11",
+        83659
+      ],
+      [
+        "E19",
+        72573
+      ],
+      [
+        "E8",
+        68557
+      ],
+      [
+        "-E1",
+        59654
+      ],
+      [
+        "E11",
+        43736
+      ],
+      [
+        "E1",
+        41985
+      ]
+    ],
+    "top_od_pairs": [
+      {
+        "origin": "E19",
+        "destination": "-E1",
+        "count": 220235
+      },
+      {
+        "origin": "-E13",
+        "destination": "-E1",
+        "count": 197620
+      },
+      {
+        "origin": "E17",
+        "destination": "-E1",
+        "count": 148548
+      },
+      {
+        "origin": "E1",
+        "destination": "E13",
+        "count": 122528
+      },
+      {
+        "origin": "E23",
+        "destination": "-E1",
+        "count": 115783
+      },
+      {
+        "origin": "E15",
+        "destination": "E13",
+        "count": 115556
+      },
+      {
+        "origin": "-E13",
+        "destination": "E16",
+        "count": 81402
+      },
+      {
+        "origin": "E1",
+        "destination": "E18",
+        "count": 64995
+      },
+      {
+        "origin": "E1",
+        "destination": "E24",
+        "count": 28412
+      },
+      {
+        "origin": "-E13",
+        "destination": "E20",
+        "count": 5536
+      }
+    ]
+  },
+  "baseline_file": "baseline_no_control.pkl",
+  "baseline_report": {
+    "summary": {
+      "total_steps": 3600,
+      "departed": 5919,
+      "arrived": 5593,
+      "arrive_ratio_simple": 0.94492312890691,
+      "ocr_doc_formula": 0.5797821549383948,
+      "total_vehicles_for_ocr": 9900,
+      "observed_unique_vehicles": 5919
+    },
+    "flow": {
+      "active_mean": 288.6575,
+      "active_max": 327,
+      "active_p95": 316.0,
+      "final_arrived": 5593
+    },
+    "speed": {
+      "mean": 8.015692412261107,
+      "std": 6.121344247340253,
+      "p10": 0.0,
+      "p50": 11.489586676169107,
+      "p90": 14.262252,
+      "low_speed_ratio_lt3": 0.35024206888786885,
+      "jam_speed_ratio_lt5": 0.37146291212095844
+    },
+    "accel": {
+      "mean_abs": 0.3079221644242397,
+      "std": 0.9557902518862227,
+      "p90_abs": 1.5069773248022011
+    },
+    "top_edges": [
+      [
+        "-E8",
+        116666
+      ],
+      [
+        "E17",
+        107177
+      ],
+      [
+        "E23",
+        99678
+      ],
+      [
+        "E15",
+        83962
+      ],
+      [
+        "E19",
+        82550
+      ],
+      [
+        "-E11",
+        80412
+      ],
+      [
+        "E8",
+        68785
+      ],
+      [
+        "-E1",
+        58857
+      ],
+      [
+        "E11",
+        43951
+      ],
+      [
+        "E1",
+        41995
+      ]
+    ],
+    "top_od_pairs": [
+      {
+        "origin": "E19",
+        "destination": "-E1",
+        "count": 196437
+      },
+      {
+        "origin": "-E13",
+        "destination": "-E1",
+        "count": 159285
+      },
+      {
+        "origin": "E17",
+        "destination": "-E1",
+        "count": 142411
+      },
+      {
+        "origin": "E1",
+        "destination": "E13",
+        "count": 122368
+      },
+      {
+        "origin": "E23",
+        "destination": "-E1",
+        "count": 116089
+      },
+      {
+        "origin": "E15",
+        "destination": "E13",
+        "count": 115285
+      },
+      {
+        "origin": "-E13",
+        "destination": "E16",
+        "count": 80361
+      },
+      {
+        "origin": "E1",
+        "destination": "E18",
+        "count": 65549
+      },
+      {
+        "origin": "E1",
+        "destination": "E24",
+        "count": 28412
+      },
+      {
+        "origin": "-E13",
+        "destination": "E20",
+        "count": 12970
+      }
+    ]
+  },
+  "delta_vs_baseline": {
+    "ocr_doc_delta": 0.00799492255746892,
+    "arrive_ratio_delta": 0.004617389054660581,
+    "active_mean_delta": 17.068888888888864,
+    "speed_mean_delta": -0.26924937482109623,
+    "speed_std_delta": -0.005392183013056773,
+    "mean_abs_accel_delta": 0.0659469329954207,
+    "low_speed_ratio_lt3_delta": 0.014275950583063302,
+    "jam_speed_ratio_lt5_delta": 0.021379271567252223
+  }
+}

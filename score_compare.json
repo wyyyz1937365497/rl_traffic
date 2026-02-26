@@ -1,0 +1,30 @@
+[
+  {
+    "pkl_file": "submit_bc_v4_fixed_state.pkl",
+    "total_score": 0.1514,
+    "efficiency_score": 0.2626,
+    "stability_score": 0.1072,
+    "intervention_penalty": 0.8189,
+    "intervention_cost": 0.019976,
+    "ocr": 0.9474,
+    "speed_std": 6.1049,
+    "mean_abs_accel": 0.3198,
+    "ocr_improvement": 0.0026,
+    "I_speed_std": 0.0027,
+    "I_mean_accel": -0.0386
+  },
+  {
+    "pkl_file": "baseline_no_control.pkl",
+    "total_score": 0.0,
+    "efficiency_score": 0,
+    "stability_score": 0.0,
+    "intervention_penalty": 0.819,
+    "intervention_cost": 0.01997,
+    "ocr": 0.9449,
+    "speed_std": 6.1213,
+    "mean_abs_accel": 0.3079,
+    "ocr_improvement": 0.0,
+    "I_speed_std": -0.0,
+    "I_mean_accel": -0.0
+  }
+]
